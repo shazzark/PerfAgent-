@@ -1,17 +1,17 @@
-"""PerfAgent orchestrator - Phase 2: The Brain.
+"""PerfAgent orchestrator - Phase 3: The Eyes.
 
 The orchestrator is one LLM tool-calling loop:
 
-1. Send the user's goal, plus the `run_load_test` tool schema, to Groq.
-2. If the model asks for the tool, execute it locally and feed the JSON result
-   back as a `tool` message.
+1. Send the user's goal, plus the `run_full_diagnostic` tool schema, to Groq.
+2. If the model asks for the tool, execute it locally (load test + CPU/memory
+   profiling) and feed the JSON result back as a `tool` message.
 3. Repeat until the model answers without requesting another tool.
 
 Groq exposes an OpenAI-compatible API, so the official `openai` SDK is used
 with `base_url` pointing at `https://api.groq.com/openai/v1`.
 
 Usage:
-    py agent.py "Load test http://127.0.0.1:8000/slow with 20 requests"
+    py agent.py "Diagnose http://127.0.0.1:8000/heavy with 12 requests"
     py agent.py            # runs the built-in demo prompt
 """
 
@@ -23,7 +23,7 @@ from typing import Any
 from dotenv import load_dotenv
 from openai import OpenAI
 
-from tools import run_load_test
+from tools import run_full_diagnostic
 
 load_dotenv()
 
@@ -35,20 +35,48 @@ DEFAULT_MODEL = "openai/gpt-oss-120b"
 MAX_TOOL_ROUNDS = 5
 
 DEFAULT_PROMPT = (
-    "Please load test the endpoint http://127.0.0.1:8000/slow with 20 requests. "
-    "Tell me if it is fast or slow, and what the bottleneck likely is."
+    "Run a full diagnostic on http://127.0.0.1:8000/heavy with 12 requests. "
+    "Correlate the CPU usage with the response times and tell me whether the "
+    "bottleneck is CPU-bound or waiting on something else."
 )
 
 SYSTEM_PROMPT = (
     "You are PerfAgent, an autonomous API performance engineer. "
-    "Whenever the user asks you to measure, test, or benchmark an endpoint, "
-    "you must call the run_load_test tool instead of estimating results yourself. "
-    "Never invent latency, throughput, or failure numbers. "
+    "Whenever the user asks you to measure, test, benchmark, or diagnose an "
+    "endpoint, you must call the run_full_diagnostic tool instead of estimating "
+    "results yourself. "
+    "That tool load-tests the endpoint while sampling machine CPU and memory, and "
+    "it also samples a two second idle baseline immediately before the test. "
+    "Never invent latency, throughput, CPU, memory, or failure numbers. "
     "If the target URL is missing, ask the user for it. "
-    "After a test, report throughput, success and failure counts, then name the "
-    "most likely bottleneck using only the returned metrics and suggest the next "
-    "diagnostic step. Keep the answer concise and technical."
+    "When you read the result, follow these rules:\n"
+    "1. Absolute CPU and memory are machine-wide: they include the load "
+    "generator, the agent process, and any unrelated software on the host. Never "
+    "call a workload memory-bound because the absolute memory number is high. A "
+    "resource only implicates the target if it *changed* while the requests were "
+    "in flight, which is what cpu_delta_percent and memory_delta_percent measure, "
+    "and what the cpu_samples series shows second by second.\n"
+    "2. Quote the baseline next to the load figures, for example 'CPU rose from "
+    "24% idle to 43% average (peak 99%) during the run, a delta of +19 points'.\n"
+    "3. An average is diluted when the whole load test fits in a fraction of the "
+    "five second window, so weigh peak_cpu_percent and the cpu_samples spike "
+    "alongside the average. profile_covers_full_load_test=false means the metrics "
+    "describe only a prefix of the run.\n"
+    "4. Per-request latency is in load_test.avg_latency_seconds, "
+    "p95_latency_seconds and max_latency_seconds. Never derive latency by dividing "
+    "total_time_seconds by total_requests: requests run ten at a time, so that "
+    "division understates what a single client waited by roughly the concurrency "
+    "factor.\n"
+    "5. Then name the most likely bottleneck: CPU rising sharply with per-request "
+    "latency near the CPU work time indicates a CPU-bound workload; high latency "
+    "with flat CPU and memory deltas indicates sleeping, blocking I/O, or a "
+    "downstream dependency; failures or timeouts point at saturation or a "
+    "connection limit.\n"
+    "Report throughput, success and failure counts, the CPU and memory deltas, "
+    "and how confident the reading is given the sampling window. Suggest the next "
+    "diagnostic step and keep the answer concise and technical."
 )
+
 
 BASE_URL = os.getenv("LLM_BASE_URL", DEFAULT_BASE_URL)
 MODEL = os.getenv("LLM_MODEL", DEFAULT_MODEL)
@@ -58,10 +86,18 @@ TOOLS: list[dict[str, Any]] = [
     {
         "type": "function",
         "function": {
-            "name": "run_load_test",
+            "name": "run_full_diagnostic",
             "description": (
-                "Run a concurrent HTTP load test against a single endpoint and "
-                "return latency, success/failure counts, and requests per second."
+                "Run a concurrent HTTP load test against a single endpoint while "
+                "profiling machine CPU and memory over a 5 second window. Samples a "
+                "2 second idle baseline immediately before the test, then returns "
+                "latency (average, p95, max per request), success/failure counts and "
+                "requests per second, plus "
+                "average and peak CPU/memory percentages, the per-second sample "
+                "series, and the idle-to-load deltas (cpu_delta_percent, "
+                "memory_delta_percent) for the same run. Use the deltas and the "
+                "peak rather than raw absolute values, because the absolute figures "
+                "include unrelated software on the host."
             ),
             "parameters": {
                 "type": "object",
@@ -70,7 +106,7 @@ TOOLS: list[dict[str, Any]] = [
                         "type": "string",
                         "description": (
                             "Absolute URL to test, including scheme and port "
-                            "(for example http://127.0.0.1:8000/slow)."
+                            "(for example http://127.0.0.1:8000/heavy)."
                         ),
                     },
                     "total_requests": {
@@ -85,6 +121,7 @@ TOOLS: list[dict[str, Any]] = [
         },
     }
 ]
+
 
 
 def create_client() -> OpenAI:
@@ -112,18 +149,19 @@ def _execute_tool(name: str, arguments: dict[str, Any]) -> dict[str, Any]:
     Tool failures are returned as data rather than raised so the model can
     correct its arguments or report the problem instead of crashing the run.
     """
-    if name != "run_load_test":
+    if name != "run_full_diagnostic":
         return {"error": f"Unknown tool: {name}"}
 
     url = arguments.get("url")
     if not isinstance(url, str) or not url:
-        return {"error": "run_load_test requires a non-empty 'url' argument"}
+        return {"error": "run_full_diagnostic requires a non-empty 'url' argument"}
 
     try:
         total_requests = int(arguments.get("total_requests", 10))
-        return run_load_test(url=url, total_requests=total_requests)
+        return run_full_diagnostic(url=url, total_requests=total_requests)
     except (TypeError, ValueError) as exc:
-        return {"error": f"Invalid arguments for run_load_test: {exc}"}
+        return {"error": f"Invalid arguments for run_full_diagnostic: {exc}"}
+
 
 
 def run_agent(user_prompt: str, client: OpenAI | None = None) -> str:
