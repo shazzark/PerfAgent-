@@ -1,0 +1,21 @@
+# Secrets and local configuration
+.env
+.env.*
+
+# Python bytecode / caches
+__pycache__/
+*.py[cod]
+.pytest_cache/
+
+# Virtual environments
+.venv/
+venv/
+
+# Generated reports and tool results
+*.json
+
+# Editor / OS noise
+.vscode/
+.idea/
+Thumbs.db
+.DS_Store
