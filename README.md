@@ -1,5 +1,7 @@
 # PerfAgent
 
+[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
+
 **An AI agent that load-tests your API, reads the numbers, and tells you where
 the bottleneck is.**
 
@@ -552,9 +554,15 @@ are in [ARCHITECTURE.md](ARCHITECTURE.md).
 
 ## Security notes
 
-`.env` is gitignored and the API key is read only through `python-dotenv`. Do not
-paste keys into `agent.py`, issues, or documentation. Only load-test systems you
-own or are authorised to test.
+Never commit `.env` or any file containing an API key. `.env` and `.env.*` are
+gitignored, and the code reads the key only through `python-dotenv`, so there is
+no reason for a secret to enter version control. If a key is exposed anyway -
+committed, pasted into an issue or pull request, or printed in a log - rotate it
+immediately in the provider console and treat the old key as compromised.
+Removing the line in a later commit does not remove it from Git history.
+
+Do not paste keys into `agent.py`, issues, or documentation. Only load-test
+systems you own or are authorised to test.
 
 Staging writes one file (`staging_api.py`, in the project root) and deletes it in a
 `finally`. It will not overwrite a `staging_api.py` that already exists, and it
@@ -562,3 +570,21 @@ refuses to stop a process on the target port unless that process is a uvicorn
 server this run started — anything else raises instead of being killed. Model
 output is parsed and compiled before it is served, and it is never written over the
 file that was measured.
+
+## Contributing
+
+Bug reports, feature requests, documentation fixes, and new tests are all
+welcome. Read [CONTRIBUTING.md](CONTRIBUTING.md) for local setup, the pull
+request checklist, and commit conventions. The suite runs from the project root:
+
+```powershell
+py -m unittest discover -s tests -t .
+```
+
+Open issues through the templates in
+[`.github/ISSUE_TEMPLATE`](.github/ISSUE_TEMPLATE) so a report includes the
+command, environment, and reproduction steps needed to act on it.
+
+## License
+
+Released under the [MIT License](LICENSE). Copyright (c) 2026 shazzark.
