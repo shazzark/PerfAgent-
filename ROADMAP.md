@@ -13,27 +13,39 @@
 - [x] Execute tool calls and feed results back for analysis
 - [x] Harden the prompt and error handling based on live runs
 
-## Phase 3: The Eyes (Profiler - In Progress)
+## Phase 3: The Eyes (Profiler - Completed)
 
 - [x] Add a CPU-bound `/heavy` endpoint to the dummy target API (time-boxed 256 KB hashing loop, ~1.5 s per request, spread across cores)
 - [x] Machine-level CPU and memory profiler (`profiler.py`, `psutil`)
 - [x] `run_full_diagnostic` runs the load test on a background thread while the profiler samples the same window, returning one combined payload
 - [x] Update the agent tool schema and system prompt so latency is correlated with CPU and memory
+
+Deferred past Phase 4, tracked so they are not lost:
+
 - [ ] Instrument the target API to capture per-request CPU and request traces
 - [ ] Correlate database query time with endpoint response latency
 - [ ] Persist raw metrics for every load-test run
 
 Current Phase 3 limitation: the profiler measures the whole machine, not the
 target process, so a load generator sharing the host contributes to the CPU
-figure. The fixed 5 s sampling window can also be shorter than a long load test;
-`profile_covers_full_load_test` reports when that happened.
+figure. On a host that is already busy the idle baseline is high, the load
+window has no headroom left, and the CPU delta can no longer separate the
+target from unrelated software. The fixed 5 s sampling window can also be
+shorter than a long load test; `profile_covers_full_load_test` reports when that
+happened.
 
 
-## Phase 4: AI Analysis
+## Phase 4: AI Analysis & Suggestion (In Progress)
 
-- [ ] Feed profiling data to the LLM for root-cause analysis
-- [ ] Rank bottlenecks by measured impact
-- [ ] Produce concrete remediation suggestions (indexes, caching, pooling)
+- [x] Feed profiling data to the LLM for root-cause analysis
+- [x] Rank bottlenecks by measured impact
+- [x] Produce concrete remediation suggestions (indexes, caching, pooling)
+- [x] Deterministic second call (`suggester.suggest_code_fix`) so every measured diagnosis ends in one fenced diff, command, or SQL statement
+- [x] Gate the suggestion on a diagnostic that actually produced load numbers, so conversational answers pass through unchanged
+- [x] Report a suggestion-provider failure inline instead of discarding the measurements
+- [x] Contract tests for the diagnosis -> suggestion wiring (`tests/`, scripted fake client)
+- [ ] Per-process CPU sampling for the target, so a busy dev machine cannot mask the CPU signal
+- [ ] Apply the suggested fix automatically and re-test (moves to Phase 5)
 
 ## Phase 5: Feedback Loop
 

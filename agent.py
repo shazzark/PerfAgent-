@@ -1,11 +1,14 @@
-"""PerfAgent orchestrator - Phase 3: The Eyes.
+"""PerfAgent orchestrator - Phase 4: AI Analysis & Suggestion.
 
-The orchestrator is one LLM tool-calling loop:
+The orchestrator is one LLM tool-calling loop followed by one remediation call:
 
 1. Send the user's goal, plus the `run_full_diagnostic` tool schema, to Groq.
 2. If the model asks for the tool, execute it locally (load test + CPU/memory
    profiling) and feed the JSON result back as a `tool` message.
-3. Repeat until the model answers without requesting another tool.
+3. Repeat until the model answers without requesting another tool. That answer
+   is the diagnosis.
+4. If a diagnostic actually ran, call `suggester.suggest_code_fix(diagnosis)` and
+   return the diagnosis plus one concrete code/infrastructure fix.
 
 Groq exposes an OpenAI-compatible API, so the official `openai` SDK is used
 with `base_url` pointing at `https://api.groq.com/openai/v1`.
@@ -16,19 +19,14 @@ Usage:
 """
 
 import json
-import os
 import sys
 from typing import Any
 
-from dotenv import load_dotenv
 from openai import OpenAI
 
+from llm_client import MODEL, create_client
+from suggester import SUGGESTION_HEADING, suggest_code_fix
 from tools import run_full_diagnostic
-
-load_dotenv()
-
-DEFAULT_BASE_URL = "https://api.groq.com/openai/v1"
-DEFAULT_MODEL = "openai/gpt-oss-120b"
 
 # Safety valve: a well-behaved model needs one round to call the tool and one
 # to explain the result. Anything beyond this is a loop and should fail loudly.
@@ -73,13 +71,12 @@ SYSTEM_PROMPT = (
     "downstream dependency; failures or timeouts point at saturation or a "
     "connection limit.\n"
     "Report throughput, success and failure counts, the CPU and memory deltas, "
-    "and how confident the reading is given the sampling window. Suggest the next "
-    "diagnostic step and keep the answer concise and technical."
+    "and how confident the reading is given the sampling window. Name the single "
+    "most likely bottleneck first and rank any others by measured impact. Keep "
+    "the answer concise and technical. Do not write code, a patch, or a "
+    "remediation plan: a separate step turns this diagnosis into one concrete "
+    "fix, so the diagnosis is all that is needed here."
 )
-
-
-BASE_URL = os.getenv("LLM_BASE_URL", DEFAULT_BASE_URL)
-MODEL = os.getenv("LLM_MODEL", DEFAULT_MODEL)
 
 # The model reads this schema to decide whether and how to call the tool.
 TOOLS: list[dict[str, Any]] = [
@@ -124,16 +121,6 @@ TOOLS: list[dict[str, Any]] = [
 
 
 
-def create_client() -> OpenAI:
-    """Build the Groq-backed OpenAI client, failing early on missing config."""
-    api_key = os.getenv("LLM_API_KEY")
-    if not api_key:
-        raise RuntimeError(
-            "LLM_API_KEY is not set. Put it in .env (see README.md, 'Configuration')."
-        )
-    return OpenAI(api_key=api_key, base_url=BASE_URL)
-
-
 def _parse_arguments(raw_arguments: str) -> dict[str, Any]:
     """Decode the model's JSON argument string, tolerating malformed output."""
     try:
@@ -164,8 +151,35 @@ def _execute_tool(name: str, arguments: dict[str, Any]) -> dict[str, Any]:
 
 
 
+def _with_suggested_fix(diagnosis: str, client: OpenAI) -> str:
+    """Return `diagnosis` followed by one concrete remediation.
+
+    The suggestion is a second, narrowly scoped model call. A provider failure
+    here must not discard a completed measurement, so the error is reported in
+    the answer itself instead of being raised.
+    """
+    print("🩺 Asking the model for a concrete fix...")
+    try:
+        fix = suggest_code_fix(diagnosis, client=client)
+    except Exception as exc:  # noqa: BLE001 - keep the diagnosis, surface the cause
+        print(f"⚠️  Suggestion step failed: {exc}")
+        return (
+            f"**Diagnosis**\n\n{diagnosis}\n\n{SUGGESTION_HEADING}\n\n"
+            f"_Suggestion unavailable: {exc}_"
+        )
+
+    report = f"**Diagnosis**\n\n{diagnosis}\n\n{SUGGESTION_HEADING}\n\n{fix}"
+    return report
+
+
 def run_agent(user_prompt: str, client: OpenAI | None = None) -> str:
-    """Resolve `user_prompt` with tool calls and return the model's final answer."""
+    """Resolve `user_prompt`, then turn the measured diagnosis into a fix.
+
+    The tool loop yields the diagnosis; the remediation call that follows is
+    what makes the run actionable. `diagnostic_ran` gates that second call, so a
+    purely conversational answer is returned unchanged instead of being sent off
+    for an unrelated patch.
+    """
     client = client or create_client()
     print(f"👤 User: {user_prompt}\n")
 
@@ -173,6 +187,7 @@ def run_agent(user_prompt: str, client: OpenAI | None = None) -> str:
         {"role": "system", "content": SYSTEM_PROMPT},
         {"role": "user", "content": user_prompt},
     ]
+    diagnostic_ran = False
 
     for _round in range(1, MAX_TOOL_ROUNDS + 1):
         response = client.chat.completions.create(
@@ -184,9 +199,19 @@ def run_agent(user_prompt: str, client: OpenAI | None = None) -> str:
         message = response.choices[0].message
 
         if not message.tool_calls:
-            answer = message.content or "(the model returned an empty response)"
-            print(f"🤖 PerfAgent: {answer}")
-            return answer
+            analysis = (message.content or "").strip()
+            if not analysis:
+                answer = "(the model returned an empty response)"
+                print(f"🤖 PerfAgent: {answer}")
+                return answer
+            if not diagnostic_ran:
+                # Nothing was measured, so there is no bottleneck to remediate.
+                print(f"🤖 PerfAgent: {analysis}")
+                return analysis
+
+            report = _with_suggested_fix(analysis, client)
+            print(f"🤖 PerfAgent (diagnosis + suggested fix):\n{report}")
+            return report
 
         # The assistant turn must be echoed back before its tool results,
         # otherwise the next request is rejected for an orphaned tool_call_id.
@@ -199,6 +224,10 @@ def run_agent(user_prompt: str, client: OpenAI | None = None) -> str:
 
             result = _execute_tool(name, arguments)
             print(f"   ↳ Result: {json.dumps(result)}")
+            # Only a diagnostic that actually produced load numbers justifies a
+            # remediation; a failed run has no measured bottleneck to explain.
+            if name == "run_full_diagnostic" and result.get("load_test"):
+                diagnostic_ran = True
 
             messages.append(
                 {

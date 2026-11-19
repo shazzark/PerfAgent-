@@ -19,24 +19,32 @@ and the tool — the OpenAI-compatible tool-calling contract *is* the interface.
 | Parallelism | `threading.Thread` | Load test on a background thread beside the profiler |
 | Resource metrics | `psutil` | Machine CPU and memory sampling (`profiler.py`) |
 | Timing | `time.perf_counter()` | Monotonic wall-clock measurement |
+| Testing | `unittest` (stdlib) + scripted fake client | Orchestration contract tests without network or SDK cost |
 
 ## Components
 
 ```
-agent.py            Orchestrator: prompt -> LLM -> tool call -> LLM -> answer
+agent.py            Orchestrator: prompt -> LLM -> tool call -> LLM -> answer,
+                    then suggester.suggest_code_fix() for the remediation
+suggester.py        suggest_code_fix(diagnosis) -> one fenced remediation
+llm_client.py       Shared MODEL, BASE_URL and create_client() factory
 tools.py            run_load_test(url, total_requests) -> load metrics
                     run_full_diagnostic(url, total_requests) -> load + system metrics
 profiler.py         get_system_metrics(duration_seconds) -> avg CPU/memory
 load_test_tool.py   Deprecated re-export of run_load_test (Phase 1 compatibility)
 dummy_api.py        FastAPI target: /health (instant), /slow (1.5 s sleep),
                     /heavy (1.5 s of real CPU-bound hashing)
+tests/              Unittest suite: orchestration wiring, suggester contract
 list_models.py      Diagnostics: prints models available to the Groq key
 test_connection.py  Diagnostics: single chat completion against the configured model
 ```
 
-Each file has one job. `agent.py` owns conversation state and LLM I/O;
-`tools.py` owns measurement orchestration; `profiler.py` owns resource sampling;
-neither tool module knows the LLM exists.
+Each file has one job. `agent.py` owns conversation state, LLM I/O, and the
+order of the two model calls; `suggester.py` owns the remediation prompt and
+never measures; `llm_client.py` owns configuration so both callers share one
+client without a circular import; `tools.py` owns measurement orchestration;
+`profiler.py` owns resource sampling; no tool or profiler module knows the LLM
+exists.
 
 
 ## Request flow
@@ -63,6 +71,16 @@ agent.run_agent()
    │             messages.append({"role": "tool", ...})
    │                                             │
    └──────────────────── loop (max 5 rounds) ◄───┘
+
+   no tool_calls and diagnostic_ran == False  ->  return the answer unchanged
+   no tool_calls and diagnostic_ran == True
+                                            |
+                                            ▼
+   _with_suggested_fix(diagnosis, client)
+      └─ suggester.suggest_code_fix(diagnosis)  ──►  Groq chat.completions
+                                            |
+                                            ▼
+   "**Diagnosis** <analysis>  ## Suggested fix <fenced code>"
 ```
 
 
@@ -195,6 +213,31 @@ Design points:
 
 
 
+## Suggester (`suggester.py`)
+
+`suggest_code_fix(diagnosis_summary, client=None)` makes exactly one completion
+call: a system prompt that fixes the output shape, and the diagnosis injected
+verbatim into `FIX_PROMPT_TEMPLATE`. It returns the model's reply — at most two
+sentences of lead-in plus one fenced code block — after rejecting an empty
+diagnosis (`ValueError`) or an empty reply (`RuntimeError`).
+
+Why it is a plain function and not a second tool:
+
+- **Deterministic, not discretionary.** A tool the model may or may not call
+  makes the headline feature unreliable; a post-loop call guarantees that a
+  measured diagnosis always ends in a fix.
+- **The input is the finished diagnosis.** The orchestrator hands over the
+  model's *final* analysis, not a mid-loop observation, and the suggestion call
+  sees no tool schemas and no metric JSON to re-interpret.
+- **The tool loop stays small.** One measurable tool, one safety valve. The
+  remediation prompt has no tool access, so it cannot start a second loop.
+- **Failures are contained.** `_with_suggested_fix` catches provider errors and
+  returns the diagnosis with `_Suggestion unavailable: ..._`, because losing a
+  completed measurement to a failed second call would be the worse outcome.
+
+`SUGGEST_SYSTEM_PROMPT` also forbids repeating the diagnosis or inventing
+metrics: the fix must stand on the measurement, not restate it.
+
 ## Configuration
 
 | Variable | Required | Default | Purpose |
@@ -230,6 +273,10 @@ the API key never enters source control or tool output.
 - **Failures as data.** HTTP-level failures are reported, not raised. Only
   configuration errors (missing key), invalid tool arguments, and a runaway tool
   loop abort a run.
+- **Remediation is orchestrated, not delegated.** The fix call is sequenced by
+  the orchestrator after the analysis, which costs one extra round trip but makes
+  the output contract (`**Diagnosis**` then `## Suggested fix`) a property of the
+  code rather than of model behaviour.
 
 ## Known limitations
 
@@ -238,6 +285,11 @@ the API key never enters source control or tool output.
 - Synchronous request path; the orchestrator blocks until the model answers.
 - CPU/memory are machine-wide and sampled on a fixed window, not per-process and
   not per-request; a load test longer than the window is only partially covered.
+- With a busy host the machine-wide baseline leaves no headroom, so the CPU delta
+  cannot separate the target process from unrelated software. Process-scoped
+  sampling (`psutil.Process(pid)`) is the tracked fix.
+- Suggested fixes are model output: nothing applies, compiles, or regression-tests
+  them, and the remediation call sees only the diagnosis text, not the repository.
 - The target API is a local FastAPI app with no database, so database bottleneck
   detection still depends on future target-side instrumentation.
 

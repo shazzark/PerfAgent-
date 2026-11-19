@@ -6,9 +6,10 @@ the bottleneck is.**
 PerfAgent gives a large language model a real performance-testing tool instead
 of asking it to guess. You describe a target in plain English; the agent runs a
 concurrent load generator while sampling CPU and memory, then answers with an
-evidence-based read on performance.
+evidence-based read on performance and a concrete fix for the bottleneck it
+found.
 
-```text
+````text
 You:  Diagnose http://127.0.0.1:8000/heavy with 12 requests.
 Agent: [calls run_full_diagnostic(url=..., total_requests=12)]
        -> {"load_test": {"total_time_seconds": 3.12, "successful": 12,
@@ -22,7 +23,17 @@ Agent: Each request took ~1.6 s and all 12 succeeded. CPU went from a 37.9% idle
        queue for cores, which is why latency is ~1.6 s per request instead of
        milliseconds. The same burst against /slow kept CPU at 27% peak, i.e. the
        time there is spent sleeping rather than computing.
-```
+
+       ## Suggested fix
+
+       Reduce Gunicorn workers to match the number of logical CPUs, eliminating
+       CPU oversubscription.
+
+       ```diff
+       - workers = 10
+       + workers = 8
+       ```
+````
 
 ## Goal
 
@@ -42,7 +53,19 @@ PerfAgent is a tool-calling loop built on the OpenAI Python SDK:
 2. If the model requests the tool, the orchestrator executes it locally and
    returns the JSON result as a `tool` message.
 3. The model analyses the metrics and either asks for another tool call or
-   answers. The loop is capped at 5 rounds to prevent runaway calls.
+   answers. The loop is capped at 5 rounds to prevent runaway calls. That answer
+   is the diagnosis.
+4. If a diagnostic actually ran, the orchestrator passes the finished diagnosis
+   to `suggester.suggest_code_fix()` and returns **Diagnosis** followed by
+   **Suggested fix** — one narrow model call whose only job is a directly
+   applicable diff, command, or statement.
+
+The remediation is *not* exposed to the model as a selectable tool: the
+orchestrator calls it deterministically once the diagnosis exists, so the fix is
+produced exactly once, always from the model's own final analysis, and never
+from a half-formed intermediate thought. Conversational answers and failed
+diagnostics skip that stage entirely, and a provider error there is reported
+inline instead of discarding measurements that already succeeded.
 
 The tool exposed today is `run_full_diagnostic(url, total_requests)`. It starts
 `run_load_test` (10 workers, 15 s diagnostic deadline) on a background thread and
@@ -55,10 +78,12 @@ remains available for latency-only runs with its 3 s interactive deadline.
 
 ## Status
 
-Phase 3 — **The Eyes (Profiler)** is in progress: `/heavy`, the profiler, the
+Phase 3 — **The Eyes (Profiler)** is complete: `/heavy`, the profiler, the
 combined diagnostic tool, and the correlation-aware prompt are implemented and
-verified. Target-side tracing, query timing, and metric persistence are still
-open (see [ROADMAP.md](ROADMAP.md)).
+verified. Phase 4 — **AI Analysis & Suggestion** is in progress: the agent now
+ranks the bottleneck from measured data and appends one concrete remediation.
+Target-side tracing, query timing, metric persistence, and the apply-and-retest
+loop are still open (see [ROADMAP.md](ROADMAP.md)).
 
 
 ## Requirements
@@ -114,16 +139,34 @@ py profiler.py     # 5 s of idle-machine CPU/memory samples
 py tools.py        # smoke-tests /health, /slow, then a full diagnostic on /heavy
 ```
 
+The remediation stage has its own smoke test, which spends exactly one model call
+on a canned CPU-bound diagnosis:
+
+```powershell
+py suggester.py    # -> one short lead-in plus a fenced diff/command
+```
+
+The orchestrator contract (diagnosis -> suggestion, and the cases where no
+suggestion runs) is covered by tests that script the model, so they need no API
+key, no target server, and no network:
+
+```powershell
+py -m unittest discover -s tests -t . -v
+```
+
 
 ## Project structure
 
 ```text
 PerfAgent/
-├── agent.py            Orchestrator: LLM tool-calling loop (Phase 3)
+├── agent.py            Orchestrator: tool loop, then diagnosis + suggested fix
+├── suggester.py        suggest_code_fix() - one model call, one remediation
+├── llm_client.py       Shared model id, base URL, and client factory
 ├── tools.py            run_load_test() and run_full_diagnostic()
 ├── profiler.py         get_system_metrics() - CPU/memory sampling via psutil
 ├── load_test_tool.py   Deprecated re-export kept for Phase 1 compatibility
 ├── dummy_api.py        FastAPI target: /health, /slow (sleep), /heavy (CPU-bound)
+├── tests/              Unittest suite: orchestration and suggester contracts
 ├── list_models.py      Diagnostics: list models available to your key
 ├── test_connection.py  Diagnostics: one chat completion smoke test
 ├── ROADMAP.md          Five-phase delivery plan
@@ -164,8 +207,8 @@ rounds are the only conditions that abort a run.
 
 1. **The Muscle (Tools) — completed.** Dummy API, concurrent load generator.
 2. **The Brain (Orchestrator) — completed.** LLM tool calling via Groq.
-3. **The Eyes (Profiler) — in progress.** CPU and memory correlated with load.
-4. **AI Analysis.** Root-cause ranking and remediation suggestions.
+3. **The Eyes (Profiler) — completed.** CPU and memory correlated with load.
+4. **AI Analysis — in progress.** Root-cause ranking plus one concrete fix.
 5. **Feedback Loop.** Apply fixes in staging, re-test, compare.
 
 Full detail and checklists live in [ROADMAP.md](ROADMAP.md); technical decisions
@@ -175,6 +218,9 @@ are in [ARCHITECTURE.md](ARCHITECTURE.md).
 
 - Single-burst load only — no ramp-up, duration, or mixed scenarios.
 - No result persistence or comparison between runs yet.
+- Suggested fixes are model output: they are not applied, compiled, or
+  regression-tested, and nothing yet checks that the patch is valid against your
+  codebase. Review before applying.
 - CPU and memory are machine-wide and sampled on a fixed 5 s window, not
   per-process or per-request.
 - The bundled target API has no database, so database bottleneck detection
