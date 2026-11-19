@@ -55,10 +55,13 @@ PerfAgent is a tool-calling loop built on the OpenAI Python SDK:
 3. The model analyses the metrics and either asks for another tool call or
    answers. The loop is capped at 5 rounds to prevent runaway calls. That answer
    is the diagnosis.
-4. If a diagnostic actually ran, the orchestrator passes the finished diagnosis
-   to `suggester.suggest_code_fix()` and returns **Diagnosis** followed by
-   **Suggested fix** — one narrow model call whose only job is a directly
-   applicable diff, command, or statement.
+4. If a diagnostic actually ran, the orchestrator resolves the file that declares
+   the measured route (explicit `source_file` -> `PERFAGENT_SOURCE_FILE` -> a
+   project-root scan for the exact route decorator), reads it, and passes the
+   diagnosis plus that source to `suggester.suggest_code_fix()`. It returns
+   **Diagnosis** followed by **Suggested fix** — one narrow model call whose only
+   job is a directly applicable diff, command, or statement written against the
+   framework the code is actually built on.
 
 The remediation is *not* exposed to the model as a selectable tool: the
 orchestrator calls it deterministically once the diagnosis exists, so the fix is
@@ -66,6 +69,16 @@ produced exactly once, always from the model's own final analysis, and never
 from a half-formed intermediate thought. Conversational answers and failed
 diagnostics skip that stage entirely, and a provider error there is reported
 inline instead of discarding measurements that already succeeded.
+
+The remediation call also receives the target's source code, because a diagnosis
+says *why* a handler is slow but nothing about *what it is written in*. Before
+that context was injected, a live run guessed Flask and diffed a `Blueprint` in
+a non-existent `app/routes.py` for a service that is a 95-line FastAPI module.
+`source_code_context` is therefore a required argument of
+`suggest_code_fix()`, and `agent.py` resolves it from the URL the tool actually
+measured. If the file cannot be resolved or read, the diagnosis is still
+returned with a framework-agnostic fix and an explicit note that the source was
+unavailable - it never silently reverts to a guess.
 
 The tool exposed today is `run_full_diagnostic(url, total_requests)`. It starts
 `run_load_test` (10 workers, 15 s diagnostic deadline) on a background thread and
@@ -78,12 +91,16 @@ remains available for latency-only runs with its 3 s interactive deadline.
 
 ## Status
 
-Phases 1–4 are complete. Phase 4 — **AI Analysis & Suggestion** — was verified
+Phases 1–4.5 are complete. Phase 4 — **AI Analysis & Suggestion** — was verified
 end to end: a 12-request burst on `/heavy` raised CPU from a 31.7% idle baseline
 to a 91.1% peak (+27.8 points) while memory stayed flat, the model named the
 handler CPU-bound, and the remediation stage returned a `ProcessPoolExecutor`
-diff. Target-side tracing, query timing, metric persistence, and the
-apply-and-retest loop are still open (see [ROADMAP.md](ROADMAP.md)).
+diff. That run also exposed the framework hallucination (a Flask `Blueprint` for a
+FastAPI service), so Phase 4.5 injects the target's source code: the re-run
+resolved `/heavy` to `dummy_api.py`, and the returned diff reuses that module's
+imports, `_burn_cpu`, `CPU_BURN_SECONDS`, and handler name with `async def` plus a
+`ProcessPoolExecutor`. Target-side tracing, query timing, metric persistence, and
+the apply-and-retest loop are still open (see [ROADMAP.md](ROADMAP.md)).
 
 
 ## Requirements
@@ -132,7 +149,18 @@ py agent.py "Diagnose http://127.0.0.1:8000/heavy with 10 requests and tell me i
 ```
 
 Running `py agent.py` with no arguments uses the built-in demo prompt against
-`/heavy`. The tools can also be exercised without the LLM:
+`/heavy`. Before asking for a fix, the agent looks for the project file that
+declares the measured route (`@app.get("/heavy")` in `dummy_api.py`) and sends its
+source with the diagnosis, so the patch matches the real framework. Point it at a
+different file when the target lives outside the project root or behind a path
+decorator the scan cannot see:
+
+```powershell
+py agent.py --source path/to/app.py "Diagnose http://127.0.0.1:8000/heavy"
+$env:PERFAGENT_SOURCE_FILE = "path/to/app.py"   # same override, via the environment
+```
+
+The tools can also be exercised without the LLM:
 
 ```powershell
 py profiler.py     # 5 s of idle-machine CPU/memory samples
@@ -140,15 +168,16 @@ py tools.py        # smoke-tests /health, /slow, then a full diagnostic on /heav
 ```
 
 The remediation stage has its own smoke test, which spends exactly one model call
-on a canned CPU-bound diagnosis:
+on a canned CPU-bound diagnosis against a small FastAPI source snippet:
 
 ```powershell
 py suggester.py    # -> one short lead-in plus a fenced diff/command
 ```
 
-The orchestrator contract (diagnosis -> suggestion, and the cases where no
-suggestion runs) is covered by tests that script the model, so they need no API
-key, no target server, and no network:
+The orchestrator contract (diagnosis -> suggestion, the cases where no suggestion
+runs, and how the target's source code is resolved and attached) is covered by
+tests that script the model, so they need no API key, no target server, and no
+network:
 
 ```powershell
 py -m unittest discover -s tests -t . -v
@@ -159,14 +188,14 @@ py -m unittest discover -s tests -t . -v
 
 ```text
 PerfAgent/
-├── agent.py            Orchestrator: tool loop, then diagnosis + suggested fix
-├── suggester.py        suggest_code_fix() - one model call, one remediation
+├── agent.py            Orchestrator: tool loop, source lookup, suggested fix
+├── suggester.py        suggest_code_fix() - one model call against real code
 ├── llm_client.py       Shared model id, base URL, and client factory
 ├── tools.py            run_load_test() and run_full_diagnostic()
 ├── profiler.py         get_system_metrics() - CPU/memory sampling via psutil
 ├── load_test_tool.py   Deprecated re-export kept for Phase 1 compatibility
 ├── dummy_api.py        FastAPI target: /health, /slow (sleep), /heavy (CPU-bound)
-├── tests/              Unittest suite: orchestration and suggester contracts
+├── tests/              Unittest suite: orchestration, suggester, source context
 ├── list_models.py      Diagnostics: list models available to your key
 ├── test_connection.py  Diagnostics: one chat completion smoke test
 ├── ROADMAP.md          Five-phase delivery plan

@@ -25,8 +25,8 @@ and the tool — the OpenAI-compatible tool-calling contract *is* the interface.
 
 ```
 agent.py            Orchestrator: prompt -> LLM -> tool call -> LLM -> answer,
-                    then suggester.suggest_code_fix() for the remediation
-suggester.py        suggest_code_fix(diagnosis) -> one fenced remediation
+                    then source lookup + suggester.suggest_code_fix()
+suggester.py        suggest_code_fix(diagnosis, source) -> one fenced remediation
 llm_client.py       Shared MODEL, BASE_URL and create_client() factory
 tools.py            run_load_test(url, total_requests) -> load metrics
                     run_full_diagnostic(url, total_requests) -> load + system metrics
@@ -34,7 +34,7 @@ profiler.py         get_system_metrics(duration_seconds) -> avg CPU/memory
 load_test_tool.py   Deprecated re-export of run_load_test (Phase 1 compatibility)
 dummy_api.py        FastAPI target: /health (instant), /slow (1.5 s sleep),
                     /heavy (1.5 s of real CPU-bound hashing)
-tests/              Unittest suite: orchestration wiring, suggester contract
+tests/              Unittest suite: orchestration, suggester, source context
 list_models.py      Diagnostics: prints models available to the Groq key
 test_connection.py  Diagnostics: single chat completion against the configured model
 ```
@@ -76,8 +76,9 @@ agent.run_agent()
    no tool_calls and diagnostic_ran == True
                                             |
                                             ▼
-   _with_suggested_fix(diagnosis, client)
-      └─ suggester.suggest_code_fix(diagnosis)  ──►  Groq chat.completions
+   _with_suggested_fix(diagnosis, client, measured_url, source_file)
+      ├─ load_source_context(measured_url)     (explicit -> env -> route scan)
+      └─ suggester.suggest_code_fix(diagnosis, source)  ──►  Groq chat.completions
                                             |
                                             ▼
    "**Diagnosis** <analysis>  ## Suggested fix <fenced code>"
@@ -215,13 +216,49 @@ Design points:
 
 ## Suggester (`suggester.py`)
 
-`suggest_code_fix(diagnosis_summary, client=None)` makes exactly one completion
-call: a system prompt that fixes the output shape, and the diagnosis injected
-verbatim into `FIX_PROMPT_TEMPLATE`. It returns the model's reply — at most two
+`suggest_code_fix(diagnosis_summary, source_code_context, client=None)` makes
+exactly one completion call: a system prompt that fixes the output shape, and a
+user message carrying both the diagnosis and the target's source code verbatim
+inside `FIX_PROMPT_TEMPLATE`. It returns the model's reply — at most two
 sentences of lead-in plus one fenced code block — after rejecting an empty
-diagnosis (`ValueError`) or an empty reply (`RuntimeError`).
+diagnosis (`ValueError`), a non-string context (`ValueError`), or an empty reply
+(`RuntimeError`).
 
-Why it is a plain function and not a second tool:
+`source_code_context` has no default and is deliberately a required positional
+argument. Phase 4 sent the diagnosis alone, and the first live run invented a
+Flask `Blueprint` patch for a FastAPI module — a fix that could not be applied.
+A default would let that bug return silently, so the only way to omit the code is
+to pass an empty string explicitly, which the prompt reports as
+`NO_SOURCE_CONTEXT` ("framework and handler signatures are unknown") instead of
+letting the model guess.
+
+### Source context resolution (`agent.py`)
+
+`load_source_context(url, source_file)` runs before the remediation call and
+returns the text handed to the suggester:
+
+- **Precedence:** explicit `run_agent(source_file=...)` / `--source`, then
+  `PERFAGENT_SOURCE_FILE`, then `find_source_file(url)`.
+- **Route scan:** `find_source_file` reads only `*.py` files in the project root
+  (skipping the agent's own modules) and accepts only a decorator whose path
+  matches exactly, `@<obj>.<get|post|put|patch|delete|head|options|route|api_route>("/heavy")`.
+  A docstring that mentions `/heavy` therefore does not count. This is
+  intentionally a local, shallow search: a general AST index or router registry
+  would encode assumptions about layouts this project does not own, and an
+  unresolved endpoint is a valid, reported outcome.
+- **Measured URL, not the prompt:** the URL comes from the successful
+  `run_full_diagnostic` result (`diagnostic_url`), so the code attached is the
+  file that was actually exercised even if the user's prompt named several.
+- **Size cap:** `MAX_SOURCE_CONTEXT_CHARS` (16,000) truncates with an explicit
+  marker, keeping the code from crowding out the remediation instruction.
+- **Failure is contained:** a missing or unreadable file prints the reason,
+  returns `""`, and the suggester answers without code context. Losing a
+  completed measurement would be the worse failure.
+
+The context is prefixed with `# File: <name>` so a suggested diff names the real
+file instead of inventing a path.
+
+Why the remediation is a plain function and not a second tool:
 
 - **Deterministic, not discretionary.** A tool the model may or may not call
   makes the headline feature unreliable; a post-loop call guarantees that a
@@ -245,6 +282,7 @@ metrics: the fix must stand on the measurement, not restate it.
 | `LLM_API_KEY` | Yes | — | Groq API key |
 | `LLM_BASE_URL` | No | `https://api.groq.com/openai/v1` | OpenAI-compatible endpoint |
 | `LLM_MODEL` | No | `openai/gpt-oss-120b` | Model id sent to the provider |
+| `PERFAGENT_SOURCE_FILE` | No | — | Overrides route-to-file detection for the remediation call |
 
 `python-dotenv` reads `.env` at import; real environment variables still win
 because `load_dotenv()` does not override existing values. `.env` is gitignored;
@@ -277,6 +315,16 @@ the API key never enters source control or tool output.
   the orchestrator after the analysis, which costs one extra round trip but makes
   the output contract (`**Diagnosis**` then `## Suggested fix`) a property of the
   code rather than of model behaviour.
+- **The suggester must read the code it patches.** Giving the model the
+  diagnosis alone produced a Flask fix for a FastAPI service on the first live
+  run. Sending the measured route's source is the smallest change that removes
+  the guess: no repository indexing, no embeddings, no extra round trip, just the
+  one file whose decorator matched. Keeping the argument required means a future
+  caller cannot regress to a blind suggestion by forgetting it.
+- **Degrade to honest, not to clever.** When the source cannot be located, the
+  prompt says the framework is unknown and asks for a framework-agnostic fix,
+  rather than omitting the context silently and inviting the model to infer a
+  stack from the diagnosis wording.
 
 ## Known limitations
 
@@ -289,8 +337,11 @@ the API key never enters source control or tool output.
   cannot separate the target process from unrelated software. Process-scoped
   sampling (`psutil.Process(pid)`) is the tracked fix.
 - Suggested fixes are model output: nothing applies, compiles, or regression-tests
-  them, and the remediation call sees only the diagnosis text, not the repository,
-  so it can name the wrong framework or file.
+  them. The remediation call now reads the file that declares the measured route,
+  but only that one file: routes registered through `include_router`, mounted
+  sub-apps, or files outside the project root still resolve to no context (or the
+  wrong file if `PERFAGENT_SOURCE_FILE` is set carelessly), and the fix cannot see
+  helpers or configuration it would need to change alongside the handler.
 
 - The target API is a local FastAPI app with no database, so database bottleneck
   detection still depends on future target-side instrumentation.

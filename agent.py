@@ -7,20 +7,27 @@ The orchestrator is one LLM tool-calling loop followed by one remediation call:
    profiling) and feed the JSON result back as a `tool` message.
 3. Repeat until the model answers without requesting another tool. That answer
    is the diagnosis.
-4. If a diagnostic actually ran, call `suggester.suggest_code_fix(diagnosis)` and
-   return the diagnosis plus one concrete code/infrastructure fix.
+4. If a diagnostic actually ran, resolve the file that declares the measured
+   route, read it, and call `suggester.suggest_code_fix(diagnosis, source)`, so
+   the fix is written against the real framework instead of a guess. The answer
+   is the diagnosis plus one concrete code/infrastructure fix.
 
 Groq exposes an OpenAI-compatible API, so the official `openai` SDK is used
 with `base_url` pointing at `https://api.groq.com/openai/v1`.
 
 Usage:
     py agent.py "Diagnose http://127.0.0.1:8000/heavy with 12 requests"
+    py agent.py --source path/to/app.py "Diagnose http://host:8000/heavy"
     py agent.py            # runs the built-in demo prompt
 """
 
 import json
+import os
+import re
 import sys
+from pathlib import Path
 from typing import Any
+from urllib.parse import urlparse
 
 from openai import OpenAI
 
@@ -31,6 +38,42 @@ from tools import run_full_diagnostic
 # Safety valve: a well-behaved model needs one round to call the tool and one
 # to explain the result. Anything beyond this is a loop and should fail loudly.
 MAX_TOOL_ROUNDS = 5
+
+# The remediation call is only trustworthy when the model can see the code it is
+# patching: without context a live run guessed Flask for a FastAPI service and
+# produced a diff against files that do not exist. `run_agent` resolves the file
+# from (in order) an explicit argument, this environment variable, or the project
+# file that declares the measured route.
+SOURCE_FILE_ENV_VAR = "PERFAGENT_SOURCE_FILE"
+
+# The agent's own modules are never the system under test, so the route scan
+# skips them: `agent.py` and friends mention endpoint paths in docstrings.
+_AGENT_FILES = frozenset(
+    {
+        "agent.py",
+        "tools.py",
+        "suggester.py",
+        "profiler.py",
+        "llm_client.py",
+        "load_test_tool.py",
+        "list_models.py",
+        "test_connection.py",
+    }
+)
+
+# A whole module is usually what the fix needs; capping it keeps the remediation
+# prompt from being dominated by a large file the model cannot use anyway.
+MAX_SOURCE_CONTEXT_CHARS = 16_000
+
+_PROJECT_ROOT = Path(__file__).resolve().parent
+
+# Matches `@app.get("/heavy")`, `@router.post('/jobs')`, `@bp.route("/x", ...)`
+# and the FastAPI/Starlette aliases, with the path captured exactly so a
+# docstring mention of "/heavy" is not mistaken for a declaration.
+_ROUTE_DECORATOR_TEMPLATE = (
+    r"@[\w.]+\.(?:get|post|put|patch|delete|head|options|route|api_route)\("
+    r"\s*[\"']{path}[\"']"
+)
 
 DEFAULT_PROMPT = (
     "Run a full diagnostic on http://127.0.0.1:8000/heavy with 12 requests. "
@@ -151,16 +194,123 @@ def _execute_tool(name: str, arguments: dict[str, Any]) -> dict[str, Any]:
 
 
 
-def _with_suggested_fix(diagnosis: str, client: OpenAI) -> str:
+def _endpoint_path(url: str | None) -> str | None:
+    """Return the request path of `url`, or None when there is no usable URL."""
+    if not isinstance(url, str) or not url.strip():
+        return None
+    return urlparse(url).path or "/"
+
+
+def find_source_file(url: str | None, root: Path = _PROJECT_ROOT) -> Path | None:
+    """Return the project file that declares `url`'s route, if one exists.
+
+    Deliberately narrow: only `*.py` files in the project root are read, and only
+    an exact decorator path counts, so prose about "/heavy" cannot masquerade as
+    a definition. A richer index (AST, router registry) would encode assumptions
+    about other people's layouts; an unresolvable endpoint simply means the
+    suggestion is written without context.
+    """
+    path = _endpoint_path(url)
+    if path is None:
+        return None
+
+    pattern = re.compile(_ROUTE_DECORATOR_TEMPLATE.format(path=re.escape(path)))
+    for candidate in sorted(root.glob("*.py")):
+        if candidate.name in _AGENT_FILES:
+            continue
+        try:
+            source = candidate.read_text(encoding="utf-8", errors="replace")
+        except OSError:
+            continue
+        if pattern.search(source):
+            return candidate
+    return None
+
+
+def _resolve_source_file(
+    source_file: str | Path | None, url: str | None
+) -> Path | None:
+    """Pick the file whose code the suggester should see.
+
+    Precedence is explicit argument, then `PERFAGENT_SOURCE_FILE`, then the file
+    that declares the measured route. A configured path that does not exist is
+    reported as missing rather than silently replaced by a guess.
+    """
+    configured = source_file or os.getenv(SOURCE_FILE_ENV_VAR)
+    if not configured:
+        return find_source_file(url)
+
+    path = Path(configured).expanduser()
+    if path.is_absolute():
+        return path if path.is_file() else None
+
+    for base in (_PROJECT_ROOT, Path.cwd()):
+        candidate = base / path
+        if candidate.is_file():
+            return candidate.resolve()
+    return None
+
+
+def load_source_context(
+    url: str | None, source_file: str | Path | None = None
+) -> str:
+    """Read the target's source so the fix is written against the real code.
+
+    Returns an empty string when no file can be resolved or read. That is not
+    fatal: losing a completed diagnosis to a missing file would be the worse
+    outcome, and `suggester` turns the empty string into an explicit
+    framework-unknown note instead of guessing. The reason is printed so the
+    user knows why a fix may be generic.
+    """
+    path = _resolve_source_file(source_file, url)
+    if path is None:
+        print(
+            "📄 No source file matched the measured endpoint; "
+            "suggesting without code context."
+        )
+        return ""
+
+    try:
+        source = path.read_text(encoding="utf-8", errors="replace")
+    except OSError as exc:
+        print(f"⚠️  Could not read {path}: {exc}")
+        return ""
+
+    if len(source) > MAX_SOURCE_CONTEXT_CHARS:
+        source = (
+            source[:MAX_SOURCE_CONTEXT_CHARS]
+            + f"\n... [source truncated at {MAX_SOURCE_CONTEXT_CHARS} characters] ..."
+        )
+
+    source = source.strip()
+    if not source:
+        print(f"📄 {path.name} is empty; suggesting without code context.")
+        return ""
+
+    print(f"📄 Attaching {path.name} ({len(source)} chars) as source code context.")
+    # The filename header lets the model emit a diff that names the real file
+    # instead of inventing `app/routes.py`.
+    return f"# File: {path.name}\n{source}"
+
+
+def _with_suggested_fix(
+    diagnosis: str,
+    client: OpenAI,
+    url: str | None = None,
+    source_file: str | Path | None = None,
+) -> str:
     """Return `diagnosis` followed by one concrete remediation.
 
-    The suggestion is a second, narrowly scoped model call. A provider failure
-    here must not discard a completed measurement, so the error is reported in
-    the answer itself instead of being raised.
+    The suggestion is a second, narrowly scoped model call that now also receives
+    the target's source code, which is what keeps the fix on the same framework
+    the service is actually built on. A provider failure here must not discard a
+    completed measurement, so the error is reported in the answer itself instead
+    of being raised.
     """
+    source_context = load_source_context(url, source_file)
     print("🩺 Asking the model for a concrete fix...")
     try:
-        fix = suggest_code_fix(diagnosis, client=client)
+        fix = suggest_code_fix(diagnosis, source_context, client=client)
     except Exception as exc:  # noqa: BLE001 - keep the diagnosis, surface the cause
         print(f"⚠️  Suggestion step failed: {exc}")
         return (
@@ -172,13 +322,20 @@ def _with_suggested_fix(diagnosis: str, client: OpenAI) -> str:
     return report
 
 
-def run_agent(user_prompt: str, client: OpenAI | None = None) -> str:
+def run_agent(
+    user_prompt: str,
+    client: OpenAI | None = None,
+    source_file: str | Path | None = None,
+) -> str:
     """Resolve `user_prompt`, then turn the measured diagnosis into a fix.
 
     The tool loop yields the diagnosis; the remediation call that follows is
     what makes the run actionable. `diagnostic_ran` gates that second call, so a
     purely conversational answer is returned unchanged instead of being sent off
-    for an unrelated patch.
+    for an unrelated patch, and the URL the tool actually measured is what seeds
+    the source-file lookup, so the fix is written against the file that was
+    really exercised. `source_file` overrides that lookup when the caller knows
+    the target.
     """
     client = client or create_client()
     print(f"👤 User: {user_prompt}\n")
@@ -188,6 +345,7 @@ def run_agent(user_prompt: str, client: OpenAI | None = None) -> str:
         {"role": "user", "content": user_prompt},
     ]
     diagnostic_ran = False
+    diagnostic_url: str | None = None
 
     for _round in range(1, MAX_TOOL_ROUNDS + 1):
         response = client.chat.completions.create(
@@ -209,7 +367,7 @@ def run_agent(user_prompt: str, client: OpenAI | None = None) -> str:
                 print(f"🤖 PerfAgent: {analysis}")
                 return analysis
 
-            report = _with_suggested_fix(analysis, client)
+            report = _with_suggested_fix(analysis, client, diagnostic_url, source_file)
             print(f"🤖 PerfAgent (diagnosis + suggested fix):\n{report}")
             return report
 
@@ -228,6 +386,7 @@ def run_agent(user_prompt: str, client: OpenAI | None = None) -> str:
             # remediation; a failed run has no measured bottleneck to explain.
             if name == "run_full_diagnostic" and result.get("load_test"):
                 diagnostic_ran = True
+                diagnostic_url = result.get("url") or arguments.get("url")
 
             messages.append(
                 {
@@ -245,11 +404,22 @@ def run_agent(user_prompt: str, client: OpenAI | None = None) -> str:
 
 
 if __name__ == "__main__":
-    prompt = " ".join(sys.argv[1:]).strip() or DEFAULT_PROMPT
+    argv = sys.argv[1:]
+    source_file: str | None = None
+    if "--source" in argv:
+        index = argv.index("--source")
+        try:
+            source_file = argv[index + 1]
+        except IndexError:
+            print("❌ --source requires a file path")
+            raise SystemExit(2) from None
+        del argv[index : index + 2]
+
+    prompt = " ".join(argv).strip() or DEFAULT_PROMPT
     # The target API must be running, e.g.:
     #   py -m uvicorn dummy_api:app --reload
     try:
-        run_agent(prompt)
+        run_agent(prompt, source_file=source_file)
     except Exception as exc:  # CLI boundary: report the failure, exit non-zero
         print(f"❌ {exc}")
         raise SystemExit(1) from exc
