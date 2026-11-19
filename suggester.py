@@ -30,6 +30,8 @@ Usage:
     py suggester.py            # smoke test on a canned CPU-bound diagnosis
 """
 
+import re
+
 from openai import OpenAI
 
 from llm_client import MODEL, create_client
@@ -37,9 +39,13 @@ from llm_client import MODEL, create_client
 __all__ = [
     "FIX_PROMPT_TEMPLATE",
     "NO_SOURCE_CONTEXT",
+    "STAGED_FILE_PROMPT_TEMPLATE",
+    "STAGED_FILE_SYSTEM_PROMPT",
     "SUGGESTION_HEADING",
     "SUGGEST_SYSTEM_PROMPT",
+    "extract_python_source",
     "suggest_code_fix",
+    "suggest_staged_file",
 ]
 
 # Heading the orchestrator puts between the diagnosis and the fix.
@@ -86,6 +92,65 @@ SUGGEST_SYSTEM_PROMPT = (
     "statement the user can run. "
     "Do not repeat the diagnosis, do not invent metrics, and do not write tests."
 )
+
+
+# Phase 5 needs a runnable artifact, not a patch. LLM-written diffs are brittle to
+# apply (context drift, wrong line counts, invented hunks), so the staging loop
+# asks for the whole file back and writes it over a copy. That trades prompt size
+# for something a parser-free applier can trust: the only validation needed is
+# "does this compile and still serve the route".
+STAGED_FILE_PROMPT_TEMPLATE = (
+    "Rewrite the complete application file below with this fix applied.\n\n"
+    "Fix:\n{suggested_fix}\n\n"
+    "Current file ({file_name}):\n"
+    "```python\n{source_code}\n```\n\n"
+    "Return the ENTIRE modified file - not a diff, not a fragment, not a "
+    "summary. Every import, route and helper the fix does not need to change must "
+    "stay exactly as it is, and the file must keep serving the same routes. "
+    "Output exactly one ```python code block and nothing else."
+)
+
+STAGED_FILE_SYSTEM_PROMPT = (
+    "You are a senior Python engineer applying one already-decided performance "
+    "fix to one file. "
+    "You return the whole file, ready to run, with no commentary and no "
+    "truncation placeholders such as '# ... unchanged ...'. "
+    "Never return a diff, never rename the app object, the routes, or the helper "
+    "functions the existing code already uses, and never introduce imports that "
+    "are not used. "
+    "If the fix cannot be applied safely to this file, return the file unchanged "
+    "rather than inventing a new framework or a new module layout."
+)
+
+# Matches ```python ... ```, ```py ... ``` and bare ``` ... ``` fences. Models
+# sometimes ignore the "code block only" instruction and add a sentence, so the
+# fenced body is extracted instead of trusting the whole reply.
+_FENCE_RE = re.compile(
+    r"```[ \t]*(?:python|py)?[ \t]*\r?\n(.*?)```", re.DOTALL | re.IGNORECASE
+)
+
+
+def extract_python_source(reply: str) -> str:
+    """Return the Python source contained in a model reply.
+
+    Args:
+        reply: The raw reply, either a fenced code block or bare source.
+
+    Returns:
+        The block content, newline-terminated, so it can be written to disk.
+
+    Raises:
+        ValueError: If the reply is empty or not a string.
+    """
+    if not isinstance(reply, str) or not reply.strip():
+        raise ValueError("the model returned no file content")
+
+    match = _FENCE_RE.search(reply)
+    source = match.group(1) if match else reply
+    source = source.strip("\n")
+    if not source.strip():
+        raise ValueError("the model returned an empty code block")
+    return source + "\n"
 
 
 def suggest_code_fix(
@@ -139,6 +204,58 @@ def suggest_code_fix(
     if not fix:
         raise RuntimeError("the model returned an empty suggestion")
     return fix
+
+
+def suggest_staged_file(
+    source_code: str,
+    suggested_fix: str,
+    file_name: str = "app.py",
+    client: OpenAI | None = None,
+) -> str:
+    """Ask the model to apply `suggested_fix` and return the complete file.
+
+    Used by the Phase 5 staging loop, which cannot safely apply a model-written
+    diff. The reply is reduced to Python source by `extract_python_source`; the
+    caller is still responsible for compiling and validating it before running it.
+
+    Args:
+        source_code: The complete current contents of the file.
+        suggested_fix: The remediation produced by `suggest_code_fix`, as-is.
+        file_name: Name shown to the model, so it does not invent a path.
+        client: Optional pre-built client, reused from the orchestrator.
+
+    Returns:
+        The rewritten file, newline-terminated.
+
+    Raises:
+        ValueError: If either input is empty or not a string.
+        RuntimeError: If the model returns an empty message.
+    """
+    if not isinstance(source_code, str) or not source_code.strip():
+        raise ValueError("source_code must be a non-empty string")
+    if not isinstance(suggested_fix, str) or not suggested_fix.strip():
+        raise ValueError("suggested_fix must be a non-empty string")
+
+    client = client or create_client()
+    response = client.chat.completions.create(
+        model=MODEL,
+        messages=[
+            {"role": "system", "content": STAGED_FILE_SYSTEM_PROMPT},
+            {
+                "role": "user",
+                "content": STAGED_FILE_PROMPT_TEMPLATE.format(
+                    suggested_fix=suggested_fix.strip(),
+                    file_name=file_name,
+                    source_code=source_code.strip(),
+                ),
+            },
+        ],
+    )
+
+    reply = (response.choices[0].message.content or "").strip()
+    if not reply:
+        raise RuntimeError("the model returned an empty staged file")
+    return extract_python_source(reply)
 
 
 if __name__ == "__main__":

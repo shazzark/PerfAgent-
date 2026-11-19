@@ -91,16 +91,22 @@ remains available for latency-only runs with its 3 s interactive deadline.
 
 ## Status
 
-Phases 1–4.5 are complete. Phase 4 — **AI Analysis & Suggestion** — was verified
+Phases 1–5 are complete. Phase 4 — **AI Analysis & Suggestion** — was verified
 end to end: a 12-request burst on `/heavy` raised CPU from a 31.7% idle baseline
-to a 91.1% peak (+27.8 points) while memory stayed flat, the model named the
-handler CPU-bound, and the remediation stage returned a `ProcessPoolExecutor`
-diff. That run also exposed the framework hallucination (a Flask `Blueprint` for a
-FastAPI service), so Phase 4.5 injects the target's source code: the re-run
-resolved `/heavy` to `dummy_api.py`, and the returned diff reuses that module's
-imports, `_burn_cpu`, `CPU_BURN_SECONDS`, and handler name with `async def` plus a
-`ProcessPoolExecutor`. Target-side tracing, query timing, metric persistence, and
-the apply-and-retest loop are still open (see [ROADMAP.md](ROADMAP.md)).
+to a 91.1% peak (+27.8 points) while memory stayed flat, and the model named the
+handler CPU-bound. Phase 4.5 injects the target's source code, which resolved
+`/heavy` to `dummy_api.py` and stopped the framework hallucination (a Flask
+`Blueprint` for a FastAPI service) seen before it.
+
+Phase 5 — **Feedback Loop** — was verified live too, with a result worth reading:
+the model's `ProcessPoolExecutor` rewrite was applied to a staging copy, re-tested
+with the same 12-request burst, and **regressed** it — average latency 1532 ms →
+3322 ms, p95 1572 ms → 4787 ms, throughput 3.94 → 2.44 req/s, CPU delta +9.3
+points, no failures. The agent said so, deleted the copy, and restarted the
+original server; `dummy_api.py` never changed. A confident-sounding fix that had
+never been measured is exactly what this phase exists to catch. Target-side
+tracing, query timing, and metric persistence are still open (see
+[ROADMAP.md](ROADMAP.md)).
 
 
 ## Requirements
@@ -167,6 +173,49 @@ py profiler.py     # 5 s of idle-machine CPU/memory samples
 py tools.py        # smoke-tests /health, /slow, then a full diagnostic on /heavy
 ```
 
+### Verifying a suggested fix
+
+When a fix is suggested, an interactive run asks
+`Would you like to apply this fix to staging and verify it? (y/n)`. Answering `y`
+copies `dummy_api.py` to `staging_api.py`, asks the model to rewrite that copy
+with the fix applied, restarts uvicorn against the copy on the same port,
+re-runs the diagnostic, prints a before/after table, deletes the copy and
+restarts your original server.
+
+```powershell
+py agent.py --verify "Diagnose http://127.0.0.1:8000/heavy with 12 requests"
+```
+
+The measured run's output (a fix that made things worse, so nothing was applied):
+
+```text
+🧪 Verifying the fix on a staging copy of dummy_api.py...
+📝 Staged staging_api.py (4008 chars); dummy_api.py was not modified.
+🛑 Stopping the server on port 8000...
+🚀 Starting staging_api:app on port 8000...
+🧹 Removed staging_api.py.
+♻️  Restarting dummy_api:app on port 8000...
+🧾 Verdict: regressed - average latency rose 116.8%
+
+| Metric | Before | After | Change (after vs before) |
+| --- | --- | --- | --- |
+| Avg latency | 1532 ms | 3322 ms | +116.8% |
+| p95 latency | 1572 ms | 4787 ms | +204.5% |
+| Throughput | 3.94 req/s | 2.44 req/s | -38.1% |
+| Failed requests | 0 | 0 | +0 |
+| CPU delta | 25.65 pts | 34.95 pts | +9.3 pts |
+
+**Verdict: regressed** - average latency rose 116.8%.
+```
+
+`--verify` skips the prompt (for scripts and unattended runs); `--no-verify` will
+never ask. The prompt is also skipped when stdin is not a terminal, so a piped or
+CI run cannot block on `input()`. Lower latency and higher throughput are better,
+so a negative latency change is a win; only changes of 5% or more are called real,
+and a new failed request always counts as a regression. The measured file is never
+written — if the copy does not parse, does not assign `app`, or drops the measured
+route, the run is aborted before any server starts.
+
 The remediation stage has its own smoke test, which spends exactly one model call
 on a canned CPU-bound diagnosis against a small FastAPI source snippet:
 
@@ -188,20 +237,21 @@ py -m unittest discover -s tests -t . -v
 
 ```text
 PerfAgent/
-├── agent.py            Orchestrator: tool loop, source lookup, suggested fix
-├── suggester.py        suggest_code_fix() - one model call against real code
+├── agent.py            Orchestrator: tool loop, source lookup, suggested fix, --verify
+├── suggester.py        suggest_code_fix() + suggest_staged_file() - one model call each
+├── feedback_loop.py    Staging copy, restart cycle, before/after comparison
 ├── llm_client.py       Shared model id, base URL, and client factory
 ├── tools.py            run_load_test() and run_full_diagnostic()
 ├── profiler.py         get_system_metrics() - CPU/memory sampling via psutil
 ├── load_test_tool.py   Deprecated re-export kept for Phase 1 compatibility
 ├── dummy_api.py        FastAPI target: /health, /slow (sleep), /heavy (CPU-bound)
-├── tests/              Unittest suite: orchestration, suggester, source context
+├── tests/              Unittest suite: orchestration, suggester, staging, comparison
 ├── list_models.py      Diagnostics: list models available to your key
 ├── test_connection.py  Diagnostics: one chat completion smoke test
 ├── ROADMAP.md          Five-phase delivery plan
 ├── ARCHITECTURE.md     Stack, components, tool contract, design decisions
 ├── README.md           This file
-└── .gitignore          Excludes .env, caches, and generated JSON
+└── .gitignore          Excludes .env, caches, generated JSON, and the staging copy
 ```
 
 ## What the numbers mean
@@ -238,7 +288,7 @@ rounds are the only conditions that abort a run.
 2. **The Brain (Orchestrator) — completed.** LLM tool calling via Groq.
 3. **The Eyes (Profiler) — completed.** CPU and memory correlated with load.
 4. **AI Analysis — completed.** Root-cause ranking plus one concrete fix.
-5. **Feedback Loop.** Apply fixes in staging, re-test, compare.
+5. **Feedback Loop — completed.** Apply the fix to a staging copy, re-test, compare.
 
 Full detail and checklists live in [ROADMAP.md](ROADMAP.md); technical decisions
 are in [ARCHITECTURE.md](ARCHITECTURE.md).
@@ -247,11 +297,16 @@ are in [ARCHITECTURE.md](ARCHITECTURE.md).
 
 - Single-burst load only — no ramp-up, duration, or mixed scenarios.
 - No result persistence or comparison between runs yet.
-- Suggested fixes are model output: they are not applied, compiled, or
-  regression-tested, and nothing yet checks that the patch is valid against your
-  codebase. The remediation call sees only the diagnosis text, not your source
-  tree, so it can target the wrong framework (a Flask diff for a FastAPI target
-  was observed). Review before applying.
+- Suggested fixes are model output, and only the file that declares the measured
+  route is ever staged. Verification covers one endpoint, one burst size, and one
+  run: a fix that helps `/heavy` may hurt `/slow`, and a ±few percent reading is
+  inside host noise. A staged rewrite that the model truncates or mangles is
+  rejected by validation instead of being measured, so a rejected fix is not
+  evidence that it was wrong. The staging server replaces the one on the measured
+  port for the duration of the re-test, so nothing else can use that port, and the
+  original is restarted without `--reload`.
+- Nothing is deployed anywhere: the loop writes, serves, measures and deletes a
+  local copy. Applying a verified fix to the real file is still a manual step.
 - CPU and memory are machine-wide and sampled on a fixed 5 s window, not
   per-process or per-request.
 - The bundled target API has no database, so database bottleneck detection
@@ -265,3 +320,10 @@ are in [ARCHITECTURE.md](ARCHITECTURE.md).
 `.env` is gitignored and the API key is read only through `python-dotenv`. Do not
 paste keys into `agent.py`, issues, or documentation. Only load-test systems you
 own or are authorised to test.
+
+Staging writes one file (`staging_api.py`, in the project root) and deletes it in a
+`finally`. It will not overwrite a `staging_api.py` that already exists, and it
+refuses to stop a process on the target port unless that process is a uvicorn
+server this run started — anything else raises instead of being killed. Model
+output is parsed and compiled before it is served, and it is never written over the
+file that was measured.

@@ -67,8 +67,29 @@ codebase the model has never read, so the context gap was closed before Phase 5.
 - [x] Verify live: `/heavy` resolved to `dummy_api.py` (3,795 chars), and the suggested diff stayed on FastAPI - `async def heavy_endpoint`, `asyncio.get_running_loop()`, `ProcessPoolExecutor`, reusing `_burn_cpu` and `CPU_BURN_SECONDS` - instead of the Phase 4 Flask guess
 
 
-## Phase 5: Feedback Loop
+## Phase 5: Feedback Loop (Completed)
 
-- [ ] Apply proposed fixes in a Docker staging environment
-- [ ] Re-run the same load test and compare before/after metrics
-- [ ] Report a regression-checked summary of what changed and what improved
+The original plan was a Docker staging environment. Docker was dropped: a copy of
+the target served by uvicorn on the same port reproduces the feedback loop with no
+image build, no mounts, and nothing left behind between runs - and it is the same
+runtime the measured server already used, so the before/after comparison is not
+confounded by container-vs-host behaviour. Deploying to production remains out of
+scope by design; the loop only ever restarts a local process.
+
+- [x] `feedback_loop.run_feedback_loop()` copies the measured file to `staging_api.py`, applies the fix to the copy, and never writes the original
+- [x] Full-file rewrite instead of diff application (`suggester.suggest_staged_file`): LLM diffs carry invented hunk headers and drifted context, and a half-applied patch is indistinguishable from a regression
+- [x] Validation gate: the staged copy must parse (`ast.parse`), assign `app`, and still declare the measured route before any server starts; a diff body or fragment is rejected
+- [x] Restart cycle: stop the uvicorn on the target port, serve `staging_api:app` on the same port, re-run the identical diagnostic, delete the copy and restart the original module in a `finally`
+- [x] Guardrails: refuse to kill a port holder that is not a uvicorn server, refuse to overwrite a pre-existing `staging_api.py`, and never write the measured file
+- [x] Before/after comparison on avg/p95 latency, throughput, failed requests and CPU delta, with a 5% noise floor and failures outranking speedups
+- [x] `agent.py` asks "Would you like to apply this fix to staging and verify it? (y/n)", only in an interactive terminal; `--verify` and `--no-verify` cover unattended runs
+- [x] A failed verification degrades to the diagnosis plus the reason instead of a traceback
+- [x] Tests for the rewrite prompt contract, the validation gate, the comparison rules and the cleanup/restore path (`tests/test_phase5_feedback.py`)
+- [x] Verify live: `py agent.py --verify "Diagnose http://127.0.0.1:8000/heavy with 12 requests"` staged the model's `ProcessPoolExecutor` rewrite and measured it at 1532 ms -> 3322 ms average latency (a 116.8% increase, improvement -116.8%; p95 1572 ms -> 4787 ms, throughput 3.94 -> 2.44 req/s, CPU delta +9.3 points, 0 failures) on an 8-core host, i.e. **regressed**: 12 concurrent 1.5 s CPU tasks plus pool startup and IPC cost more than the threadpool they replaced. `dummy_api.py` was untouched, `staging_api.py` was deleted, and `dummy_api:app` was serving on port 8000 again afterwards. The loop's first live verdict is a rejection - which is the point: the same fix read as plausible in prose and would have shipped unmeasured.
+
+Deferred past Phase 5:
+
+- [ ] Containerised staging for targets whose dependencies cannot be installed on the host
+- [ ] Regression gate across the other endpoints, so a fix cannot trade one bottleneck for another
+- [ ] Persist each before/after pair next to the metrics it was computed from
+

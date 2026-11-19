@@ -25,8 +25,11 @@ and the tool — the OpenAI-compatible tool-calling contract *is* the interface.
 
 ```
 agent.py            Orchestrator: prompt -> LLM -> tool call -> LLM -> answer,
-                    then source lookup + suggester.suggest_code_fix()
+                    then source lookup + suggester.suggest_code_fix(), then the
+                    optional staging verification
 suggester.py        suggest_code_fix(diagnosis, source) -> one fenced remediation
+                    suggest_staged_file(source, fix) -> the whole fixed file
+feedback_loop.py    Staging verification: copy -> fix -> serve -> re-test -> compare
 llm_client.py       Shared MODEL, BASE_URL and create_client() factory
 tools.py            run_load_test(url, total_requests) -> load metrics
                     run_full_diagnostic(url, total_requests) -> load + system metrics
@@ -41,10 +44,11 @@ test_connection.py  Diagnostics: single chat completion against the configured m
 
 Each file has one job. `agent.py` owns conversation state, LLM I/O, and the
 order of the two model calls; `suggester.py` owns the remediation prompt and
-never measures; `llm_client.py` owns configuration so both callers share one
-client without a circular import; `tools.py` owns measurement orchestration;
-`profiler.py` owns resource sampling; no tool or profiler module knows the LLM
-exists.
+never measures; `feedback_loop.py` owns the staging process lifecycle and never
+writes the measured file; `llm_client.py` owns configuration so both callers
+share one client without a circular import; `tools.py` owns measurement
+orchestration; `profiler.py` owns resource sampling; no tool or profiler module
+knows the LLM exists.
 
 
 ## Request flow
@@ -76,12 +80,23 @@ agent.run_agent()
    no tool_calls and diagnostic_ran == True
                                             |
                                             ▼
-   _with_suggested_fix(diagnosis, client, measured_url, source_file)
-      ├─ load_source_context(measured_url)     (explicit -> env -> route scan)
+   _with_suggested_fix(diagnosis, client, source_context)
+      (source_path + context resolved once in run_agent: explicit -> env -> route)
       └─ suggester.suggest_code_fix(diagnosis, source)  ──►  Groq chat.completions
                                             |
                                             ▼
    "**Diagnosis** <analysis>  ## Suggested fix <fenced code>"
+                                            |
+                          verify? prompt / --verify / --no-verify
+                                            |
+                                            ▼
+   _maybe_verify()  ->  feedback_loop.run_feedback_loop()
+      ├─ suggest_staged_file()          whole file, fix applied
+      ├─ validate_staged_source()       parses + `app` + measured route
+      ├─ LocalServer: stop -> start("staging_api") on the same port
+      ├─ run_full_diagnostic(url, n)    identical burst
+      ├─ compare_metrics(before, after) verdict + deltas
+      └─ finally: delete staging_api.py -> start("dummy_api")
 ```
 
 
@@ -275,7 +290,87 @@ Why the remediation is a plain function and not a second tool:
 `SUGGEST_SYSTEM_PROMPT` also forbids repeating the diagnosis or inventing
 metrics: the fix must stand on the measurement, not restate it.
 
-## Configuration
+## Feedback loop (`feedback_loop.py`)
+
+Phase 4 ends with a hypothesis. Phase 5 turns it into evidence: the fix is applied
+to a throwaway copy of the measured file, served on the same port, and re-measured
+with the identical diagnostic. Nothing is deployed; production is out of scope by
+design.
+
+```
+suggested fix + original source (read, never written)
+   |
+   v
+suggester.suggest_staged_file()      the whole file, fix applied, fenced reply
+   |
+   v
+validate_staged_source()             parses + `app` + measured route survives
+   |  (rejects: diff body, syntax error, missing app, dropped route)
+   v
+staging_api.py                       written, then deleted in a `finally`
+   |
+   v
+LocalServer.stop() -> LocalServer.start("staging_api")     same port
+   |
+   v
+tools.run_full_diagnostic(url, n)    same burst size as the original run
+   |
+   v
+compare_metrics(before, after)       verdict + deltas
+   |
+   v
+stop() -> unlink(staging_api.py) -> start("dummy_api")
+```
+
+### Why the whole file instead of a diff
+
+LLM diffs are brittle: hunk headers with invented line counts, context lines that
+have drifted, three different `---`/`+++` conventions. A patch that half-applies
+leaves behind a file nobody can reason about, and `patch` reports success per
+hunk, so the result would have to be verified anyway. Asking for the complete file
+takes the parser out of the trust boundary: the only things that must be true are
+that the staged file is a valid module which still declares the measured route,
+and `ast` answers both deterministically.
+
+### Safety guardrails
+
+Nothing here can reach production, and nothing here can silently break the
+workstation:
+
+1. **The measured file is never written.** Only `staging_api.py` is written, and
+   only after validation passes.
+2. **Validate before executing.** `validate_staged_source` requires a parseable
+   module, a top-level `app` assignment, and the measured route path. A diff body,
+   a syntax error or a fragment is rejected before any process starts.
+3. **No clobbering.** An existing `staging_api.py` aborts the run instead of being
+   overwritten or deleted, because it is not provably this run's artifact.
+4. **Restricted kills.** `LocalServer.stop()` only terminates a process it started,
+   or a listener on the target port whose command line contains `uvicorn`. Anything
+   else holding that port raises instead of being killed, since a dev server on the
+   wrong port is far more likely than a hostile one.
+5. **Cleanup in `finally`.** The copy is unlinked and the original module restarted
+   even when the re-test raises, so a failed verification cannot leave the
+   workstation without a server.
+6. **Confirmation needs a terminal.** The y/n prompt is skipped, with a hint to use
+   `--verify`, when stdin is not a TTY - a scripted run must never hang on
+   `input()`. `--no-verify` opts out explicitly.
+7. **A failed verification is reported, not raised.** The diagnosis and suggested
+   fix survive; the appended section says why staging could not run.
+
+### Interpreting the comparison
+
+`compare_metrics` calls a change real only when the average-latency improvement
+clears `MATERIAL_CHANGE_PERCENT` (5%) and no new requests failed. Two identical
+bursts on a shared host differ by a few percent, so a 2% "win" is reported as `no
+material change`. New failures outrank any latency gain (`regressed`), and a
+missing load-test payload is `inconclusive` rather than a division by zero. The
+report shows avg/p95 latency, throughput, failed requests and the CPU delta in
+points; the CPU figure keeps the Phase 3 machine-wide caveat, so the verdict keys
+on latency and failures. The table states changes after-vs-before - a faster run
+shows a negative latency change and a positive throughput change - and the verdict
+supplies the interpretation, because a sign that means "better" for one metric
+means "worse" for the other.
+
 
 | Variable | Required | Default | Purpose |
 | --- | --- | --- | --- |
@@ -325,6 +420,18 @@ the API key never enters source control or tool output.
   prompt says the framework is unknown and asks for a framework-agnostic fix,
   rather than omitting the context silently and inviting the model to infer a
   stack from the diagnosis wording.
+- **Verification is a controlled restart, not a deployment.** The staged copy runs
+  under the same uvicorn invocation the measured server used, on the same port, so
+  the only variable between the two runs is the code. A container or a second port
+  would add a runtime difference to a comparison that is already fighting host
+  noise, and shipping to production stays a human decision.
+- **The model writes a file; the orchestrator decides whether it may run.** The
+  staged reply is validated structurally before it is importable, and the whole
+  read/write boundary is one throwaway file. That keeps "the model suggested it"
+  out of the trust boundary without pretending a parse check proves correctness.
+- **One local run is not a benchmark.** The comparison refuses to call a change
+  under 5% real and ranks new failures above any speedup, because the alternative -
+  reporting whichever number looks best - teaches the user to trust noise.
 
 ## Known limitations
 
@@ -336,12 +443,21 @@ the API key never enters source control or tool output.
 - With a busy host the machine-wide baseline leaves no headroom, so the CPU delta
   cannot separate the target process from unrelated software. Process-scoped
   sampling (`psutil.Process(pid)`) is the tracked fix.
-- Suggested fixes are model output: nothing applies, compiles, or regression-tests
-  them. The remediation call now reads the file that declares the measured route,
-  but only that one file: routes registered through `include_router`, mounted
+- Suggested fixes are model output. The staging loop now applies one to a copy and
+  re-measures it, but it does not compile-check other modules, run the project's
+  tests, or prove the rest of the app still works: one endpoint is re-tested, so a
+  fix that trades this bottleneck for another endpoint's would still be reported as
+  an improvement. Only the single file that declares the measured route can be
+  replaced, so a fix that needs to touch helpers or configuration is applied
+  partially - the copy keeps the original imports and fails at request time, which
+  the comparison reports as `inconclusive` rather than as success. The remediation
+  call reads just that file: routes registered through `include_router`, mounted
   sub-apps, or files outside the project root still resolve to no context (or the
-  wrong file if `PERFAGENT_SOURCE_FILE` is set carelessly), and the fix cannot see
-  helpers or configuration it would need to change alongside the handler.
+  wrong file if `PERFAGENT_SOURCE_FILE` is set carelessly).
+- The staging comparison is one burst on a shared host. The 5% floor bounds the
+  claim, it is not a confidence interval: two runs of identical code can still land
+  either side of it on a heavily loaded machine, and the CPU delta inherits the
+  machine-wide caveat above.
 
 - The target API is a local FastAPI app with no database, so database bottleneck
   detection still depends on future target-side instrumentation.

@@ -15,6 +15,9 @@ venv/
 *.json
 run_*.txt
 
+# Phase 5 staging artifact - deleted in a `finally`, ignored in case a run is killed
+staging_api.py
+
 # Editor / OS noise
 .vscode/
 .idea/

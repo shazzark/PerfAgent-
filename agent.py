@@ -18,6 +18,7 @@ with `base_url` pointing at `https://api.groq.com/openai/v1`.
 Usage:
     py agent.py "Diagnose http://127.0.0.1:8000/heavy with 12 requests"
     py agent.py --source path/to/app.py "Diagnose http://host:8000/heavy"
+    py agent.py --verify "Diagnose http://127.0.0.1:8000/heavy"   # skip the prompt
     py agent.py            # runs the built-in demo prompt
 """
 
@@ -31,6 +32,7 @@ from urllib.parse import urlparse
 
 from openai import OpenAI
 
+from feedback_loop import format_comparison, run_feedback_loop
 from llm_client import MODEL, create_client
 from suggester import SUGGESTION_HEADING, suggest_code_fix
 from tools import run_full_diagnostic
@@ -251,6 +253,17 @@ def _resolve_source_file(
     return None
 
 
+def source_file_for(
+    url: str | None, source_file: str | Path | None = None
+) -> Path | None:
+    """Resolve the file once, so reading it and staging it agree.
+
+    Phase 5 needs the same file the suggester was shown: resolving twice could
+    textually disagree if the project changes between calls.
+    """
+    return _resolve_source_file(source_file, url)
+
+
 def load_source_context(
     url: str | None, source_file: str | Path | None = None
 ) -> str:
@@ -296,18 +309,17 @@ def load_source_context(
 def _with_suggested_fix(
     diagnosis: str,
     client: OpenAI,
-    url: str | None = None,
-    source_file: str | Path | None = None,
-) -> str:
-    """Return `diagnosis` followed by one concrete remediation.
+    source_context: str,
+) -> tuple[str, str | None]:
+    """Return `diagnosis` plus one concrete remediation, and that fix on its own.
 
-    The suggestion is a second, narrowly scoped model call that now also receives
-    the target's source code, which is what keeps the fix on the same framework
-    the service is actually built on. A provider failure here must not discard a
+    The suggestion is a second, narrowly scoped model call that receives the
+    target's source code, which is what keeps the fix on the same framework the
+    service is actually built on. A provider failure here must not discard a
     completed measurement, so the error is reported in the answer itself instead
-    of being raised.
+    of being raised - and the fix is `None`, which is also what tells the Phase 5
+    feedback loop there is nothing to stage.
     """
-    source_context = load_source_context(url, source_file)
     print("🩺 Asking the model for a concrete fix...")
     try:
         fix = suggest_code_fix(diagnosis, source_context, client=client)
@@ -315,17 +327,101 @@ def _with_suggested_fix(
         print(f"⚠️  Suggestion step failed: {exc}")
         return (
             f"**Diagnosis**\n\n{diagnosis}\n\n{SUGGESTION_HEADING}\n\n"
-            f"_Suggestion unavailable: {exc}_"
+            f"_Suggestion unavailable: {exc}_",
+            None,
         )
 
     report = f"**Diagnosis**\n\n{diagnosis}\n\n{SUGGESTION_HEADING}\n\n{fix}"
-    return report
+    return report, fix
+
+
+def _ask_to_verify() -> bool:
+    """Ask whether to verify on staging, without ever blocking a non-terminal run."""
+    if sys.stdin is None or not sys.stdin.isatty():
+        print(
+            "↪️  Staging verification skipped: no interactive terminal. "
+            "Re-run with --verify to apply the fix to staging automatically."
+        )
+        return False
+    try:
+        answer = input(
+            "Would you like to apply this fix to staging and verify it? (y/n) "
+        )
+    except (EOFError, KeyboardInterrupt):
+        print()
+        return False
+    return answer.strip().lower() in {"y", "yes"}
+
+
+def _maybe_verify(
+    *,
+    report: str,
+    fix: str | None,
+    diagnostic_result: dict[str, Any],
+    source_path: Path | None,
+    source_context: str,
+    client: OpenAI,
+    verify: bool | None,
+) -> str:
+    """Optionally prove the fix on a staging copy and append the before/after.
+
+    The measurement is the point: a fix that is never re-tested is a hypothesis.
+    Every failure path here returns the diagnosis plus an explanation instead of
+    raising, because losing a completed diagnosis to a staging problem would be
+    the worse outcome - and the original file is never written, so declining or
+    failing is always safe.
+    """
+    if not fix or not diagnostic_result.get("load_test"):
+        # Nothing was measured, or nothing was suggested: nothing to prove.
+        return report
+    if verify is False:
+        return report
+    if source_path is None:
+        print(
+            "🧪 Staging verification skipped: the measured file could not be "
+            "resolved, so there is nothing safe to copy."
+        )
+        return report
+    if verify is not True and not _ask_to_verify():
+        return report
+
+    print(f"\n🧪 Verifying the fix on a staging copy of {source_path.name}...")
+    try:
+        result = run_feedback_loop(
+            diagnostic_result.get("url") or "",
+            source_path,
+            fix,
+            diagnostic_result,
+            source_context,
+            client=client,
+        )
+    except Exception as exc:  # noqa: BLE001 - keep the diagnosis, report the cause
+        print(f"❌ Staging verification failed: {exc}")
+        section = (
+            "## Staging verification\n\n"
+            f"Verification could not run: {exc}\n\n"
+            "The diagnosis and suggested fix above are unaffected, and "
+            f"`{source_path.name}` was not modified."
+        )
+    else:
+        section = format_comparison(
+            result["comparison"],
+            url=result["url"],
+            original_file=Path(result["original_file"]).name,
+            staged_file=Path(result["staging_file"]).name,
+            total_requests=result["total_requests"],
+        )
+        if result.get("restore_error"):
+            section += f"\n\n⚠️ Cleanup problem: {result['restore_error']}"
+    print(section)
+    return f"{report}\n\n{section}"
 
 
 def run_agent(
     user_prompt: str,
     client: OpenAI | None = None,
     source_file: str | Path | None = None,
+    verify: bool | None = False,
 ) -> str:
     """Resolve `user_prompt`, then turn the measured diagnosis into a fix.
 
@@ -336,6 +432,11 @@ def run_agent(
     the source-file lookup, so the fix is written against the file that was
     really exercised. `source_file` overrides that lookup when the caller knows
     the target.
+
+    Phase 5 appends the feedback loop. `verify=True` applies the fix to a local
+    staging copy and re-measures it, `verify=False` (the default for callers)
+    skips that, and `None` asks first - which the CLI does, but only in a real
+    terminal, so a library caller or a piped run never blocks on `input()`.
     """
     client = client or create_client()
     print(f"👤 User: {user_prompt}\n")
@@ -346,6 +447,7 @@ def run_agent(
     ]
     diagnostic_ran = False
     diagnostic_url: str | None = None
+    diagnostic_result: dict[str, Any] = {}
 
     for _round in range(1, MAX_TOOL_ROUNDS + 1):
         response = client.chat.completions.create(
@@ -367,9 +469,21 @@ def run_agent(
                 print(f"🤖 PerfAgent: {analysis}")
                 return analysis
 
-            report = _with_suggested_fix(analysis, client, diagnostic_url, source_file)
+            # Resolve once: the suggester and the staging loop must be looking at
+            # the same file, or the "verified" copy is not the one that was fixed.
+            source_path = source_file_for(diagnostic_url, source_file)
+            source_context = load_source_context(None, source_path)
+            report, fix = _with_suggested_fix(analysis, client, source_context)
             print(f"🤖 PerfAgent (diagnosis + suggested fix):\n{report}")
-            return report
+            return _maybe_verify(
+                report=report,
+                fix=fix,
+                diagnostic_result=diagnostic_result,
+                source_path=source_path,
+                source_context=source_context,
+                client=client,
+                verify=verify,
+            )
 
         # The assistant turn must be echoed back before its tool results,
         # otherwise the next request is rejected for an orphaned tool_call_id.
@@ -387,6 +501,7 @@ def run_agent(
             if name == "run_full_diagnostic" and result.get("load_test"):
                 diagnostic_ran = True
                 diagnostic_url = result.get("url") or arguments.get("url")
+                diagnostic_result = result
 
             messages.append(
                 {
@@ -415,11 +530,22 @@ if __name__ == "__main__":
             raise SystemExit(2) from None
         del argv[index : index + 2]
 
+    # `--verify` answers the staging prompt in advance (unattended runs);
+    # `--no-verify` declines it. Without either flag, the prompt appears only in
+    # an interactive terminal.
+    verify: bool | None = None
+    if "--verify" in argv:
+        argv.remove("--verify")
+        verify = True
+    if "--no-verify" in argv:
+        argv.remove("--no-verify")
+        verify = False
+
     prompt = " ".join(argv).strip() or DEFAULT_PROMPT
     # The target API must be running, e.g.:
     #   py -m uvicorn dummy_api:app --reload
     try:
-        run_agent(prompt, source_file=source_file)
+        run_agent(prompt, source_file=source_file, verify=verify)
     except Exception as exc:  # CLI boundary: report the failure, exit non-zero
         print(f"❌ {exc}")
         raise SystemExit(1) from exc
