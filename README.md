@@ -9,6 +9,42 @@ concurrent load generator while sampling CPU and memory, then answers with an
 evidence-based read on performance and a concrete fix for the bottleneck it
 found.
 
+## Why this agent is safe
+
+An LLM that sounds convincing is not a safety mechanism. PerfAgent re-measures
+every fix it suggests before anything is applied, and it is allowed to say no. In
+the first live Phase 5 run, it did.
+
+The model diagnosed the `/heavy` handler as CPU-bound and proposed replacing the
+threadpool with a `ProcessPoolExecutor` — plausible in prose, and wrong in
+practice. The agent applied it to a staging copy, re-ran the identical
+12-request burst, and measured the outcome:
+
+| Metric | Before | After | Change |
+| --- | --- | --- | --- |
+| Avg latency | 1532 ms | 3322 ms | +116.8% |
+| p95 latency | 1572 ms | 4787 ms | +204.5% |
+| Throughput | 3.94 req/s | 2.44 req/s | -38.1% |
+| Failed requests | 0 | 0 | +0 |
+| CPU delta | 25.65 pts | 34.95 pts | +9.3 pts |
+
+**Verdict: regressed — the agent rejected its own fix.** It deleted the staging
+copy, restarted the server it had stopped, and `dummy_api.py` was never modified.
+A change that read as a confident improvement would otherwise have shipped
+unmeasured.
+
+That rejection is enforced by the structure of the loop, not by prompt wording:
+
+- The measured file is never written. A fix is only ever staged into
+  `staging_api.py`, which is deleted in a `finally`.
+- A staged rewrite must parse (`ast.parse`), assign `app`, and still declare the
+  measured route before any server is started.
+- Staging refuses to overwrite a pre-existing `staging_api.py`, and refuses to
+  stop a process on the target port that is not a uvicorn server this run
+  started.
+- A new failed request always counts as a regression, and a latency or throughput
+  change under 5% is reported as noise rather than a win.
+
 ````text
 You:  Diagnose http://127.0.0.1:8000/heavy with 12 requests.
 Agent: [calls run_full_diagnostic(url=..., total_requests=12)]
