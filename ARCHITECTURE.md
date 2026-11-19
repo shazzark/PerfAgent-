@@ -110,8 +110,12 @@ does not belong to a preceding assistant turn.
 `_execute_tool` dispatches by name, the tool's per-step JSON returns as the `tool`
 message, and the model explains it. Each step runs a paced one-second burst
 through the same 10-worker pool (`_run_ramp_step`), summarises HTTP latency,
-failures, and worker queue wait (`_summarize_ramp_burst`), and the loop stops at
-the first step that breaches 5% failures or 2.0 s end-to-end average latency.
+failures, connection failures, and worker queue wait (`_summarize_ramp_burst`),
+and the loop stops only at the first step that fails 100% of its requests or
+reports a connection failure. Latency and partial failure never end the ramp;
+they are the evidence collected on the way to the crash. `step_increase=None`
+doubles the offered rate after each surviving step (10 -> 20 -> 40 -> 80), and an
+explicit integer switches to additive steps for a finer table.
 `ramp_ran` short-circuits the final answer before both the Audit report and the
 Local suggester: a capacity report has no `load_test` payload for the audit
 builder and no bottleneck that justifies a code fix.
@@ -183,7 +187,7 @@ Schema advertised to the model:
 ```
 
 Ramp schema (only `url` is required; omitted rates use the function defaults
-`start_rps=10`, `step_increase=10`, `max_rps=100`):
+`start_rps=10`, `step_increase=None` (double each step), `max_rps=1000`):
 
 ```json
 {
@@ -255,51 +259,98 @@ percentiles cover every attempt (including timeouts, which then show up as the
 client deadline) and p95 uses nearest-rank, so in a 10-request test it is simply
 the slowest attempt.
 
-Ramp payload (the measured `/slow` run from the README):
+Ramp payload (a live `/slow` run that never died):
 
 ```json
 {
   "url": "http://127.0.0.1:8000/slow",
   "start_rps": 5,
-  "step_increase": 5,
-  "max_rps": 30,
-  "found": true,
-  "breaking_rps": 20,
-  "last_successful_rps": 15,
-  "breaking_reason": "end-to-end average latency 2.018s (HTTP 1.511s + client queue 0.507s) exceeded 2.0s",
-  "breaking_point": {
-    "offered_rps": 20,
-    "total_requests": 20,
-    "successful": 20,
+  "step_increase": null,
+  "max_rps": 80,
+  "strategy": "double",
+  "found": false,
+  "breaking_rps": null,
+  "last_successful_rps": 80,
+  "crash_reason": null,
+  "breaking_reason": null,
+  "final_metrics": {
+    "offered_rps": 80,
+    "total_requests": 80,
+    "successful": 80,
     "failed": 0,
     "failure_rate_percent": 0.0,
+    "failure_breakdown": {},
+    "connection_failures": 0,
+    "all_failed": false,
     "avg_latency_seconds": 1.511,
-    "p95_latency_seconds": 1.527,
-    "max_latency_seconds": 1.527,
-    "end_to_end_avg_latency_seconds": 2.018,
-    "client_queue_avg_seconds": 0.507,
-    "client_queue_max_seconds": 1.028,
+    "p95_latency_seconds": 1.524,
+    "max_latency_seconds": 1.531,
+    "end_to_end_avg_latency_seconds": 6.365,
+    "client_queue_avg_seconds": 4.854,
+    "client_queue_max_seconds": 9.707,
     "client_limited": true
   },
-  "steps": [],
-  "thresholds": {
-    "failure_rate_percent": 5.0,
-    "avg_latency_seconds": 2.0,
-    "end_to_end_avg_latency_seconds": 2.0
+  "breaking_point": null,
+  "steps": ["every attempted step, same shape as final_metrics"],
+  "stop_conditions": {
+    "stop_on_total_failure": true,
+    "stop_on_connection_error": true,
+    "failure_rate_percent": 100.0
   },
   "client_concurrency_ceiling": 10,
   "break_was_client_limited": true
 }
 ```
 
+And a live crash payload (closed port, first step):
+
+```json
+{
+  "url": "http://127.0.0.1:8999/slow",
+  "start_rps": 5,
+  "step_increase": null,
+  "max_rps": 1000,
+  "strategy": "double",
+  "found": true,
+  "breaking_rps": 5,
+  "last_successful_rps": null,
+  "crash_reason": "Connection Refused",
+  "breaking_reason": "Connection Refused",
+  "final_metrics": {
+    "offered_rps": 5,
+    "total_requests": 5,
+    "successful": 0,
+    "failed": 5,
+    "failure_rate_percent": 100.0,
+    "failure_breakdown": { "connection_refused": 5 },
+    "connection_failures": 5,
+    "all_failed": true,
+    "avg_latency_seconds": 2.028,
+    "p95_latency_seconds": 2.054,
+    "max_latency_seconds": 2.054,
+    "end_to_end_avg_latency_seconds": 2.028,
+    "client_queue_avg_seconds": 0.001,
+    "client_queue_max_seconds": 0.002,
+    "client_limited": false
+  },
+  "breaking_point": "(alias of final_metrics)",
+  "steps": ["one step"],
+  "client_concurrency_ceiling": 10,
+  "break_was_client_limited": false
+}
+```
+
 `avg_latency_seconds` is HTTP time only. `end_to_end_avg_latency_seconds` adds
 `client_queue_avg_seconds`, the wait before one of the 10 workers starts the
-request, and that end-to-end figure is what the 2.0 s ramp threshold checks. The
-split is what lets the report say "the API was still at 1.51 s, but the client
-queue pushed the observed wait to 2.018 s" instead of attributing generator
-queueing to the server. When no step breaches, the payload has `found: false`,
-`breaking_rps: null`, `breaking_point: null`, and `last_successful_rps` set to
-`max_rps`.
+request. Keeping the two separate is what lets the report say "the API was still
+at 1.51 s, but the client queue pushed the observed wait to 6.37 s" instead of
+attributing generator queueing to the server. Latency alone never ends the ramp;
+when no step fails completely, the payload has `found: false`,
+`breaking_rps: null`, `crash_reason: null`, `breaking_point: null`, and
+`last_successful_rps` set to `max_rps`. `failure_breakdown` names each failure
+mode (`HTTP 500`, `timeout`, `connection_refused`, `connection_error`), and
+`connection_failures`/`all_failed` are derived from it so the loop never has to
+guess why a step died.
 
 A success is an HTTP `200` response inside the client deadline. The interactive
 default is 3 seconds; `run_full_diagnostic` passes
@@ -574,22 +625,23 @@ the API key never enters source control or tool output.
 - **Ramp-up is a sequence of measured steps, not a guessed capacity number.**
   Each rate is offered for a full second and summarised before the next rate is
   tried, so `last_successful_rps` is the last rate with evidence behind it. The
-  thresholds live in `tools.py`, and `breaking_reason` names the exact metric and
-  value that ended the ramp.
-- **A client-limited break is labelled, not hidden.** The fixed 10-worker pool is
-  sufficient for the bursts used in Phases 1-6, but a 1.5 s handler cannot exceed
-  roughly 6.7 completed req/s through it. The ramp therefore measures end-to-end
-  latency for the threshold while preserving HTTP latency separately and setting
-  `client_limited`. Reporting only the breaking RPS would turn a generator
-  ceiling into a false server-capacity claim; reporting only "no break" would
-  ignore the latency a client actually experienced.
+  stop rules live in `tools.py`, and `crash_reason` names the exact failure that
+  ended the ramp (`Connection Refused`, `100% HTTP 500s`, `100% timeouts`).
+- **A client-limited ramp is labelled, not hidden.** The fixed 10-worker pool
+  cannot exceed roughly 6.7 completed req/s against a 1.5 s handler, so higher
+  offered rates queue without ever killing the API. The payload preserves HTTP
+  latency separately and sets `client_limited`, so the report can say the target
+  survived while the client was the queue. Treating queue growth as a server
+  breaking point would turn a generator ceiling into a false capacity claim;
+  reporting only "no break" would ignore the wait a client actually experienced.
 
 ## Known limitations
 
 - No persistence: each run's metrics are printed and discarded.
 - No configurable rate limiting or workload scenarios. Ramp-up is a fixed policy
-  (one second per step, 5% failures, 2.0 s end-to-end latency), and each step is a
-  separate burst rather than a sustained test.
+  (one second per step, doubling by default, stop only on total failure or a
+  connection error), and each step is a separate burst rather than a sustained
+  test.
 - Synchronous request path; the orchestrator blocks until the model answers.
 - CPU/memory are machine-wide and sampled on a fixed window, not per-process and
   not per-request; a load test longer than the window is only partially covered.
@@ -618,9 +670,11 @@ the API key never enters source control or tool output.
   describe the local client, not the remote server, so they are context only. The
   2.0 s p95 threshold is a fixed policy default, not a per-target SLO.
 - Ramp-up shares the fixed 10-worker client, so on a high-latency endpoint the
-  generator can queue before the server saturates. `client_limited` and
-  `client_queue_avg_seconds` make that explicit, but a client-limited
-  `breaking_rps` is a lower bound and cannot prove the server's true capacity.
+  generator queues and the API can survive every step; `client_limited` and
+  `client_queue_avg_seconds` make that explicit. A client-limited crash rate is a
+  lower bound and cannot prove the server's true capacity. The Python client is
+  also capped at roughly 1,000 req/s (`DEFAULT_MAX_RPS`); 20,000+ RPS needs a
+  dedicated generator such as k6 or wrk.
 
 - The target API is a local FastAPI app with no database, so database bottleneck
   detection still depends on future target-side instrumentation.

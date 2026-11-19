@@ -135,14 +135,19 @@ alongside a 2 s idle baseline and the load-minus-baseline deltas. `run_load_test
 remains available for latency-only runs with its 3 s interactive deadline.
 
 The second tool, `find_breaking_point(url, start_rps, step_increase, max_rps)`,
-offers a constant request rate for one second per step and raises the rate after
-each clean step. A step breaks the ramp when more than 5% of its requests fail or
-its end-to-end average latency (HTTP time plus any wait for a generator worker)
-exceeds 2.0 s. It returns `breaking_rps`, `last_successful_rps`, the metrics at
-the breaking step, and every attempted step. The payload keeps API latency and
-client queue wait separate and sets `client_limited` when the fixed 10-worker
-generator is the queue, so a report never silently presents the generator's
-ceiling as the server's.
+is a ruthless ramp: it offers a constant request rate for one second per step and
+keeps climbing until the API is completely dead. Partial failures and
+multi-second latency are recorded, not treated as a stop signal; the ramp ends
+only at a step that fails **100%** of its requests or at a step where the target
+refuses or resets a connection (no longer accepting work). `step_increase` is
+optional: omit it and the rate doubles each
+step (10 -> 20 -> 40 -> 80), which reaches a crash in a handful of steps; pass an
+integer for a finer additive table. It returns `breaking_rps`,
+`last_successful_rps`, `crash_reason` (for example `100% HTTP 500s` or
+`Connection Refused`), the final step's metrics, and every attempted step. The
+payload keeps API latency and client queue wait separate and sets
+`client_limited` when the fixed 10-worker generator is the queue, so a capacity
+report never silently presents the generator's ceiling as the server's.
 
 
 ## Status
@@ -171,13 +176,15 @@ source/suggester/staging path is structurally bypassed. The verdict is computed
 by `agent.build_audit_report`, so model prose cannot turn a failing API green.
 
 Phase 7 — **Ramp-Up / Breaking Point** — adds `find_breaking_point`. It ramps
-offered load in one-second steps until a step exceeds 5% failures or 2.0 s
-end-to-end average latency, then reports the breaking rate, the last clean rate,
-and the metrics at the breaking step. A live run against `/slow` (1.5 s handler,
-`start_rps=5`, `max_rps=30`, `step_increase=5`) stopped at 20 RPS: HTTP latency
-was still 1.511 s, but 0.507 s of client queue pushed end-to-end latency to
-2.018 s. The payload flagged `client_limited: true`, and the agent reported 20
-RPS as a lower bound rather than claiming the server itself had failed.
+offered load in one-second steps, doubling by default, and only stops when a step
+fails every request or the target refuses the connection. A live run against
+`/slow` (1.5 s handler, `start_rps=5`, `max_rps=80`) did not crash at all: all 80
+requests succeeded, but end-to-end latency grew from 1.51 s at 10 RPS to 6.37 s
+at 80 RPS as the 10-worker Python client queued. The result was `found: false`
+with `client_limited: true`, so the agent reported the surviving rate rather than
+inventing a server-side breaking point. A second run against a closed port
+crashed at 5 RPS with `crash_reason: "Connection Refused"`, which is the exact
+kind of hard failure the ramp waits for.
 
 
 ## Requirements
@@ -348,48 +355,76 @@ Ask for the breaking point or capacity limit and the model calls
 `find_breaking_point`, not the fixed-burst diagnostic:
 
 ```powershell
-py agent.py "Find the breaking point for http://127.0.0.1:8000/slow with start_rps=5 and max_rps=30. Use step_increase=5 so I can see each 5 RPS step."
+py agent.py "Find the breaking point for http://127.0.0.1:8000/slow from 5 RPS and push until it crashes."
 ```
 
 The tool offers `rps` requests over one second, paced `1/rps` apart, then raises
-the rate by `step_increase`. It stops at the first step where either:
+the rate. With no `step_increase` it **doubles** the rate each step
+(5 -> 10 -> 20 -> 40 -> 80), which reaches a crash in a handful of steps; pass an
+integer such as `step_increase=5` when you want a finer table. It stops only when:
 
-- the failure rate is above **5%**, or
-- the **end-to-end average latency** is above **2.0 s**. End-to-end means HTTP
-  latency plus any time a request waited for one of the generator's 10 workers.
+- **100%** of a step's requests fail (every response HTTP 500, every timeout), or
+- the target refuses or resets a connection (`Connection Refused` / connection
+  reset), which outranks the failure count because it names the cause of death.
 
-A live run against `/slow` stopped at 20 RPS:
+Partial HTTP failures and slow responses do **not** stop the ramp: they are
+recorded and the next step still runs. A 5% failure rate on the way up is data,
+not a verdict, and an API that merely feels unwell has not broken yet.
 
-| Step (RPS) | Success | API avg latency | End-to-end avg | Client queue avg | Client limited? |
-| --- | --- | --- | --- | --- | --- |
-| 5 | 100% | 1.521 s | 1.521 s | 0.000 s | No |
-| 10 | 100% | 1.514 s | 1.514 s | 0.000 s | No |
-| 15 | 100% | 1.512 s | 1.792 s | 0.280 s | Yes |
-| **20** | 100% | 1.511 s | **2.018 s** | 0.507 s | Yes |
+A live run against `/slow` (1.5 s handler, `start_rps=5`, `max_rps=80`):
 
-The agent's conclusion from that run:
+| Step (RPS) | Success | API avg latency | End-to-end avg | Client limited? |
+| --- | --- | --- | --- | --- |
+| 5 | 100% | 1.517 s | 1.518 s | No |
+| 10 | 100% | 1.519 s | 1.519 s | No |
+| 20 | 100% | 1.519 s | 2.029 s | Yes |
+| 40 | 100% | 1.510 s | 3.398 s | Yes |
+| **80** | 100% | 1.511 s | **6.365 s** | Yes |
 
-> The API survived the last clean step at **15 RPS** (end-to-end latency ≈ 1.79 s).
-> At **20 RPS** the client-side queue caused the end-to-end latency to exceed 2 s,
-> so the breaking point is **≥ 20 RPS** but not definitively higher because the
-> load generator was saturated.
+The API never died: `found: false`, `breaking_rps: null`, `last_successful_rps:
+80`, `crash_reason: null`. HTTP latency stayed flat at ~1.51 s while the
+end-to-end wait grew, which is the 10-worker client queuing, not the server
+failing. The report says so (`client_limited: true`) instead of calling 6.4 s a
+server breaking point. That is the honest answer for this generator: a single
+Python process driving threaded `requests` tops out around **1000 RPS**, so a
+target that survives that ceiling needs k6 or wrk to drive 20,000+ RPS.
+
+The crash path looks like this — a live run against a closed port:
+
+```text
+Ramping http://127.0.0.1:8999/slow from 5 req/s up to at most 1000 req/s (doubling) until the API is completely dead...
+CRASH: API unreachable at 5 req/s: Connection Refused
+BREAKING POINT: 5 req/s: Connection Refused (last surviving rate: None)
+```
+
+`breaking_rps: 5`, `crash_reason: "Connection Refused"`,
+`failure_breakdown: {"connection_refused": 5}`, `last_successful_rps: null`.
+HTTP-level death is reported the same way, e.g. `crash_reason: "100% HTTP 500s"`
+or `"100% timeouts"`.
 
 The result is deliberately explicit about what broke:
 
-- `breaking_rps`: the first rate that crossed a threshold (`20` above).
-- `last_successful_rps`: the last clean rate (`15`).
-- `breaking_point`: full metrics for the failing step, including both
-  `avg_latency_seconds` (HTTP only) and `end_to_end_avg_latency_seconds`.
+- `breaking_rps`: the first rate that was completely dead (`5` above).
+- `last_successful_rps`: the last rate with at least one success (`80` for the
+  `/slow` run, `null` when the very first step crashed).
+- `crash_reason` / `breaking_reason`: why the ramp stopped, in words
+  (`Connection Refused`, `100% HTTP 500s`, `100% timeouts`,
+  `Connection Error (API unreachable)`).
+- `final_metrics` / `breaking_point`: full metrics for the stopping step,
+  including `failure_breakdown`, `connection_failures` and `all_failed`.
 - `client_queue_avg_seconds` / `client_queue_max_seconds`: time spent waiting for
   a generator worker, never folded into the API latency.
 - `client_limited`: `true` when the 10-worker generator was the queue, which makes
   the reported rate a **lower bound**, not proof of server capacity.
+- `stop_conditions`: the rules that ended the ramp (`100%` failure, connection
+  error).
 - `steps`: every attempted step, so the table above is reproducible.
-- `found: false` and `breaking_rps: null` when the API survives `max_rps`.
+- `found: false`, `breaking_rps: null` and `crash_reason: null` when the API
+  survives `max_rps`.
 
-A larger `max_rps` does not remove the generator ceiling. To measure a genuinely
-high-capacity API, raise the worker count or use a dedicated load generator; the
-current tool reports the limit it can prove and labels the client-side share.
+Raising `max_rps` does not remove the generator ceiling. To measure a genuinely
+high-capacity API, use a dedicated load generator; this tool reports the crash it
+can prove and labels the client-side share.
 
 The remediation stage has its own smoke test, which spends exactly one model call
 on a canned CPU-bound diagnosis against a small FastAPI source snippet:
@@ -445,9 +480,10 @@ PerfAgent/
 | `system_metrics.cpu_samples` / `memory_samples` | The per-second series behind the averages |
 | `cpu_delta_percent` / `memory_delta_percent` | Load average minus baseline average |
 | `profile_covers_full_load_test` | `false` when the load test outlasted the sampling window |
-| `find_breaking_point` -> `breaking_rps` / `last_successful_rps` | First rate that crossed a threshold, and the last rate that did not |
-| `breaking_point.avg_latency_seconds` | HTTP-only per-request latency at the breaking step |
-| `breaking_point.end_to_end_avg_latency_seconds` | HTTP latency plus generator queue wait; this is what the 2.0 s ramp threshold checks |
+| `find_breaking_point` -> `breaking_rps` / `last_successful_rps` | Rate where the API was completely dead (100% failure or refused connection), and the last rate with a success |
+| `breaking_point.crash_reason` | Why the ramp stopped (`Connection Refused`, `100% HTTP 500s`, `100% timeouts`); `null` when the API survived |
+| `breaking_point.avg_latency_seconds` | HTTP-only per-request latency at the stopping step |
+| `breaking_point.end_to_end_avg_latency_seconds` | HTTP latency plus generator queue wait; not a stop condition, but the wait a client felt |
 | `breaking_point.client_limited` | `true` when the fixed 10-worker generator was the bottleneck, making the rate a lower bound |
 
 Read them together: high latency with high CPU points at a CPU-bound handler;
@@ -472,16 +508,18 @@ rounds are the only conditions that abort a run.
 6. **Remote Audit — completed.** Measure a live non-localhost API and report
    Broken/Degraded/Stable without reading source or suggesting a fix.
 7. **Ramp-Up / Breaking Point — completed.** Increase offered RPS per step until
-   failure rate or end-to-end latency crosses policy, and report the breaking
-   and last-clean rates with an explicit client-limit flag.
+   the API is completely dead (100% failures or a refused connection), and report
+   the crash rate, the reason, and the last surviving rate with an explicit
+   client-limit flag.
 
 Full detail and checklists live in [ROADMAP.md](ROADMAP.md); technical decisions
 are in [ARCHITECTURE.md](ARCHITECTURE.md).
 
 ## Limitations
 
-- Ramp-up is a fixed policy: one second per step, 5% failures, 2.0 s end-to-end
-  latency. It is not a negotiated SLO and does not run mixed scenarios.
+- Ramp-up is a fixed policy: one second per step, doubling by default, and it
+  stops only on total failure or a connection error. It is not a negotiated SLO
+  and does not run mixed scenarios.
 - No result persistence or comparison between runs yet.
 - Suggested fixes are model output, and only the file that declares the measured
   route is ever staged. Verification covers one endpoint, one burst size, and one
@@ -505,9 +543,11 @@ are in [ARCHITECTURE.md](ARCHITECTURE.md).
   memory deltas describe the load generator's host, not the remote server, and
   the 2.0 s p95 threshold is a fixed policy default rather than a negotiated SLO.
 - Ramp-up uses the same 10-worker client as a burst. On a high-latency endpoint the
-  generator can become the bottleneck before the server does; `client_limited`
-  and `client_queue_avg_seconds` expose that, and a client-limited
-  `breaking_rps` is a lower bound rather than a server capacity measurement.
+  generator queues and the API can survive every step; `client_limited` and
+  `client_queue_avg_seconds` expose that, and a client-limited crash rate is a
+  lower bound rather than a server capacity measurement. The Python client is also
+  capped at roughly 1,000 req/s (`max_rps` default); 20,000+ RPS needs a dedicated
+  generator such as k6 or wrk.
 
 
 ## Security notes

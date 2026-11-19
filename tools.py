@@ -8,8 +8,8 @@ Three capabilities, one measurement model:
   in the foreground, and returns both halves as one JSON-serialisable dict so the
   model can correlate "slow" with "busy" instead of guessing.
 * `find_breaking_point` - the capacity ramp. It offers an increasing request rate
-  in one-second bursts and stops at the first step whose failure rate exceeds 5%
-  or whose end-to-end average latency exceeds 2 seconds.
+  in one-second bursts and keeps climbing past partial failures and slow answers
+  until a step fails every request or the target stops accepting connections.
 
 All return plain data that can be handed straight back to the LLM as a `tool`
 message. HTTP-level failures are measurements, not exceptions.
@@ -30,13 +30,19 @@ from profiler import get_system_metrics
 MAX_WORKERS = 10
 REQUEST_TIMEOUT_SECONDS = 3.0
 
-# Ramp-up policy. A step is one second of offered traffic at a constant rate;
-# the next step only runs if the API stayed under both limits. These are policy
-# values, not measured SLOs, and are reported in the payload so a report can
-# state exactly which threshold was crossed.
+# Ramp-up policy. A step is one second of offered traffic at a constant rate.
+# There is deliberately no failure-rate or latency threshold: partial failures
+# and multi-second answers are measurements, not stop conditions. The ramp ends
+# only when a step fails 100% of its requests or the target stops accepting
+# connections.
 RAMP_BURST_SECONDS = 1.0
-RAMP_FAILURE_THRESHOLD = 0.05
-RAMP_LATENCY_THRESHOLD_SECONDS = 2.0
+
+# Default search ceiling for the ramp. A single Python process driving threaded
+# requests is honest to roughly 1,000 offered req/s on a typical laptop; five
+# figure rates (20,000+) need an event-driven or compiled generator such as k6
+# or wrk. This is the ramp's search ceiling, not a capacity claim about the
+# target.
+DEFAULT_MAX_RPS = 1000
 
 # Above this average wait before a worker picks a request up, the 10-worker
 # client itself is the queue. The ramp still reports the limit, but the caller
@@ -177,43 +183,86 @@ def run_load_test(
     return result
 
 
-def _timed_request_meta(
+def _ramp_request(
     url: str,
     submitted_at: float,
     timeout_seconds: float = REQUEST_TIMEOUT_SECONDS,
-) -> tuple[bool, float, float]:
-    """Return `(succeeded, latency_seconds, worker_wait_seconds)` for one GET.
+) -> tuple[bool, float, float, str | None]:
+    """Return `(succeeded, latency, worker_wait, failure_kind)` for one GET.
+
+    `failure_kind` is None for HTTP 200, `HTTP <status>` for a non-200 response,
+    `connection_refused` / `connection_error` when the target cannot be reached,
+    and `timeout` when the client deadline expires. The old boolean-only helper
+    could not tell a saturated API (5xx) from a dead one (connection refused), and
+    the ruthless ramp has to distinguish exactly those two outcomes.
 
     The third value is how long the request sat in the executor queue before a
     worker started it. That is the difference between measuring the API and
-    measuring this agent's own 10-worker concurrency ceiling.
+    measuring this agent's own worker ceiling.
     """
     started = time.perf_counter()
-    succeeded = _request_succeeded(url, timeout_seconds)
+    try:
+        response = requests.get(url, timeout=timeout_seconds)
+        if response.status_code == 200:
+            succeeded, failure_kind = True, None
+        else:
+            succeeded, failure_kind = False, f"HTTP {response.status_code}"
+    except requests.exceptions.ConnectionError as exc:
+        # `requests` wraps refused connections, DNS failures, and resets in this
+        # exception. A refused socket is the clearest "the API is dead" signal,
+        # so it gets its own label for the crash reason.
+        message = str(exc).lower()
+        succeeded = False
+        failure_kind = (
+            "connection_refused"
+            if "refused" in message or "10061" in message
+            else "connection_error"
+        )
+    except requests.exceptions.Timeout:
+        succeeded, failure_kind = False, "timeout"
+    except requests.exceptions.RequestException:
+        succeeded, failure_kind = False, "request_error"
+
     finished = time.perf_counter()
-    return succeeded, finished - started, max(0.0, started - submitted_at)
+    return succeeded, finished - started, max(0.0, started - submitted_at), failure_kind
 
 
 def _summarize_ramp_burst(
-    url: str, offered_rps: int, outcomes: list[tuple[bool, float, float]], elapsed: float
+    url: str,
+    offered_rps: int,
+    outcomes: list[tuple[bool, float, float, str | None]],
+    elapsed: float,
 ) -> dict[str, Any]:
-    """Turn one burst's `(success, latency, queue_wait)` tuples into metrics."""
+    """Turn one burst's `(success, latency, queue_wait, failure_kind)` tuples into metrics."""
     total_requests = len(outcomes)
-    latencies = sorted(latency for _succeeded, latency, _wait in outcomes)
-    queue_waits = [wait for _succeeded, _latency, wait in outcomes]
-    successful = sum(1 for succeeded, _latency, _wait in outcomes if succeeded)
+    latencies = sorted(latency for _succeeded, latency, _wait, _kind in outcomes)
+    queue_waits = [wait for _succeeded, _latency, wait, _kind in outcomes]
+    successful = sum(1 for succeeded, _latency, _wait, _kind in outcomes if succeeded)
     failed = total_requests - successful
     failure_rate = failed / total_requests if total_requests else 0.0
     queue_avg = sum(queue_waits) / total_requests if total_requests else 0.0
     queue_max = max(queue_waits) if queue_waits else 0.0
     avg_latency = sum(latencies) / total_requests if total_requests else 0.0
     # End-to-end latency is what a client offering this rate actually waits:
-    # API time plus time spent queued behind the generator's 10 workers. The
-    # HTTP latency stays separate so a client-limited break is not misreported
-    # as 2 s of server think-time.
+    # API time plus time spent queued behind the generator's workers. The HTTP
+    # latency stays separate so client queueing is never reported as server
+    # think-time.
     end_to_end_avg = avg_latency + queue_avg
     # Nearest-rank p95, matching run_load_test.
     p95_index = min(len(latencies) - 1, math.ceil(0.95 * len(latencies)) - 1)
+
+    # Keep the failure modes separate: "100% HTTP 500s" and "connection refused"
+    # are different crashes, and the agent reports which one ended the ramp.
+    failure_breakdown: dict[str, int] = {}
+    for succeeded, _latency, _wait, kind in outcomes:
+        if not succeeded:
+            key = kind or "error"
+            failure_breakdown[key] = failure_breakdown.get(key, 0) + 1
+    connection_failures = sum(
+        count
+        for kind, count in failure_breakdown.items()
+        if kind.startswith("connection_")
+    )
 
     return {
         "url": url,
@@ -224,6 +273,9 @@ def _summarize_ramp_burst(
         "failed": failed,
         "failure_rate": round(failure_rate, 4),
         "failure_rate_percent": round(failure_rate * 100, 2),
+        "failure_breakdown": failure_breakdown,
+        "connection_failures": connection_failures,
+        "all_failed": total_requests > 0 and successful == 0,
         "total_time_seconds": round(elapsed, 2),
         "completion_rps": round(total_requests / elapsed, 2) if elapsed > 0 else 0.0,
         "avg_latency_seconds": round(avg_latency, 3),
@@ -239,6 +291,74 @@ def _summarize_ramp_burst(
             total_requests > MAX_WORKERS
             and queue_avg > RAMP_CLIENT_QUEUE_WARNING_SECONDS
         ),
+    }
+
+
+def _connection_crash_reason(exc: BaseException) -> str:
+    """Name the connection failure that ended the ramp.
+
+    Windows reports a closed port as WinError 10061 ("actively refused it") and
+    POSIX as `Connection refused`; both mean the API is no longer listening. Any
+    other connection error still means the target is unreachable, just without a
+    refusal to quote.
+    """
+    message = str(exc).lower()
+    if "refused" in message or "10061" in message:
+        return "Connection Refused"
+    return "Connection Error (API unreachable)"
+
+
+def _total_failure_reason(metrics: dict[str, Any]) -> str:
+    """Name the dominant failure mode of a step where nothing succeeded."""
+    breakdown = metrics.get("failure_breakdown") or {}
+    if len(breakdown) == 1:
+        kind = next(iter(breakdown))
+        if kind.startswith("HTTP "):
+            # "HTTP 500" -> "100% HTTP 500s"
+            return f"100% {kind}s"
+        if kind == "timeout":
+            return "100% timeouts"
+        if kind.startswith("connection_"):
+            return (
+                "Connection Refused"
+                if kind == "connection_refused"
+                else "Connection Error (API unreachable)"
+            )
+    return "100% of requests failed"
+
+
+def _unreachable_step_metrics(
+    url: str, offered_rps: int, error_message: str
+) -> dict[str, Any]:
+    """Build the step payload for a burst that could not reach the target.
+
+    When the client raises before a single request is measured there are no
+    latency figures to report. The record still has to carry the rate and the
+    error, because those are the crash evidence the caller reports.
+    """
+    return {
+        "url": url,
+        "offered_rps": offered_rps,
+        "burst_seconds": RAMP_BURST_SECONDS,
+        "total_requests": 0,
+        "successful": 0,
+        "failed": 0,
+        "failure_rate": 0.0,
+        "failure_rate_percent": 0.0,
+        "failure_breakdown": {"connection_error": 1},
+        "connection_failures": 1,
+        "all_failed": True,
+        "total_time_seconds": 0.0,
+        "completion_rps": 0.0,
+        "avg_latency_seconds": 0.0,
+        "p95_latency_seconds": 0.0,
+        "max_latency_seconds": 0.0,
+        "end_to_end_avg_latency_seconds": 0.0,
+        "client_queue_avg_seconds": 0.0,
+        "client_queue_max_seconds": 0.0,
+        "client_concurrency_ceiling": MAX_WORKERS,
+        "client_limited": False,
+        "error": error_message,
     }
 
 
@@ -267,7 +387,7 @@ def _run_ramp_step(url: str, offered_rps: int) -> dict[str, Any]:
                 time.sleep(wait)
             submitted_at = time.perf_counter()
             submissions.append(
-                executor.submit(_timed_request_meta, url, submitted_at)
+                executor.submit(_ramp_request, url, submitted_at)
             )
         outcomes = [future.result() for future in submissions]
 
@@ -280,128 +400,178 @@ def _run_ramp_step(url: str, offered_rps: int) -> dict[str, Any]:
 def find_breaking_point(
     url: str,
     start_rps: int = 10,
-    step_increase: int = 10,
-    max_rps: int = 100,
+    step_increase: int | None = None,
+    max_rps: int = DEFAULT_MAX_RPS,
 ) -> dict[str, Any]:
-    """Ramp offered load until the API breaches a health threshold.
+    """Ramp offered load until the API is completely dead.
 
-    Each step offers a constant `rps` for one second. A step is the breaking
-    point when either more than 5% of its requests fail or its end-to-end
-    average latency (HTTP latency plus any wait for a generator worker) is above
-    2.0 seconds. The ramp stops there; the last clean step is returned as
-    `last_successful_rps`.
+    Each step offers a constant `rps` for one second. A step that merely looks
+    unwell does not end the ramp: partial failures and multi-second answers are
+    recorded and the next step still runs, because the question is where the API
+    stops serving, not where it first becomes uncomfortable.
+
+    The ramp ends at the first step that either
+
+    * fails 100% of its requests (for example every response is HTTP 500), or
+    * reports a connection failure, i.e. the target no longer accepts connections.
+
+    `step_increase=None` (the default) doubles the offered rate after every
+    surviving step (10 -> 20 -> 40 -> 80), which reaches the crash point in a
+    handful of steps. An explicit integer switches to additive steps
+    (`start_rps + step_increase`, ...) when a finer table is wanted.
+
+    `max_rps` defaults to 1000, roughly where a single Python process driving
+    threaded requests stops being an honest load generator on a typical laptop.
+    Reaching 20,000+ req/s needs an event-driven or compiled generator such as
+    k6 or wrk; a larger `max_rps` here reports where this client ran out of
+    offered rate, not where the server ran out of capacity.
 
     Returns:
-        A JSON-serialisable dict with `breaking_rps` (None if the API survived
-        `max_rps`), `last_successful_rps`, `breaking_reason`, `breaking_point`
-        (the metrics of the failing step, or None), every attempted step in
-        `steps`, and the thresholds used.
+        A JSON-serialisable dict with `breaking_rps` (the crashing rate, or None
+        if the API survived `max_rps`), `last_successful_rps`, `crash_reason`
+        (for example "100% HTTP 500s" or "Connection Refused"), `final_metrics`
+        (the crashing step's metrics, or the last step when nothing crashed),
+        every attempted step in `steps`, and the ramp strategy.
 
-        `client_limited` on the breaking step means the generator's 10-worker
-        pool was queueing requests, so the reported RPS is a lower bound on the
-        API's capacity rather than proof of where the server failed.
+        `break_was_client_limited` means this agent's fixed worker pool was
+        queueing during the crash step, so the reported rate is a lower bound on
+        what the target could be driven to, not a hardware capacity figure.
+        `breaking_reason` is kept as an alias of `crash_reason` for callers
+        written before the ruthless ramp.
     """
-    for name, value in (
-        ("start_rps", start_rps),
-        ("step_increase", step_increase),
-        ("max_rps", max_rps),
-    ):
+    for name, value in (("start_rps", start_rps), ("max_rps", max_rps)):
         if isinstance(value, bool) or not isinstance(value, int):
             raise ValueError(f"{name} must be an integer")
+    if step_increase is not None:
+        if isinstance(step_increase, bool) or not isinstance(step_increase, int):
+            raise ValueError("step_increase must be an integer or None")
+        if step_increase < 1:
+            raise ValueError("step_increase must be at least 1 when provided")
     if start_rps < 1:
         raise ValueError("start_rps must be at least 1")
-    if step_increase < 1:
-        raise ValueError("step_increase must be at least 1")
     if max_rps < start_rps:
         raise ValueError("max_rps must be greater than or equal to start_rps")
 
+    strategy = "doubling" if step_increase is None else f"+{step_increase} req/s"
     print(
-        f"Ramping {url} from {start_rps} req/s to at most {max_rps} req/s "
-        f"in steps of {step_increase}..."
+        f"Ramping {url} from {start_rps} req/s up to at most {max_rps} req/s "
+        f"({strategy}) until the API is completely dead..."
     )
 
     steps: list[dict[str, Any]] = []
     last_successful_rps: int | None = None
+    crash_rps: int | None = None
+    crash_reason: str | None = None
+    final_metrics: dict[str, Any] | None = None
     offered_rps = start_rps
 
     while offered_rps <= max_rps:
-        metrics = _run_ramp_step(url, offered_rps)
-        steps.append(metrics)
+        try:
+            metrics = _run_ramp_step(url, offered_rps)
+        except requests.exceptions.ConnectionError as exc:
+            # A step can still raise before any request is measured (a mocked
+            # client, DNS failure, or the port closing between submission and
+            # connect). An unreachable target is exactly the crash this ramp is
+            # looking for, so record it and stop.
+            crash_rps = offered_rps
+            crash_reason = _connection_crash_reason(exc)
+            final_metrics = _unreachable_step_metrics(url, offered_rps, str(exc))
+            steps.append(final_metrics)
+            print(f"CRASH: API unreachable at {offered_rps} req/s: {crash_reason}")
+            break
 
-        failure_breach = (
-            metrics["failed"] / metrics["total_requests"]
-            > RAMP_FAILURE_THRESHOLD
-        )
-        latency_breach = (
-            metrics["end_to_end_avg_latency_seconds"]
-            > RAMP_LATENCY_THRESHOLD_SECONDS
-        )
-        if failure_breach or latency_breach:
-            reasons = []
-            if failure_breach:
-                reasons.append(
-                    f"failure rate {metrics['failure_rate_percent']:.1f}% "
-                    f"exceeded {RAMP_FAILURE_THRESHOLD * 100:.1f}%"
-                )
-            if latency_breach:
-                reasons.append(
-                    f"end-to-end average latency "
-                    f"{metrics['end_to_end_avg_latency_seconds']:.3f}s "
-                    f"(HTTP {metrics['avg_latency_seconds']:.3f}s + client queue "
-                    f"{metrics['client_queue_avg_seconds']:.3f}s) exceeded "
-                    f"{RAMP_LATENCY_THRESHOLD_SECONDS:.1f}s"
-                )
-            result = {
-                "url": url,
-                "start_rps": start_rps,
-                "step_increase": step_increase,
-                "max_rps": max_rps,
-                "found": True,
-                "breaking_rps": offered_rps,
-                "last_successful_rps": last_successful_rps,
-                "breaking_reason": " and ".join(reasons),
-                "breaking_point": metrics,
-                "steps": steps,
-                "thresholds": {
-                    "failure_rate_percent": RAMP_FAILURE_THRESHOLD * 100,
-                    "avg_latency_seconds": RAMP_LATENCY_THRESHOLD_SECONDS,
-                    "end_to_end_avg_latency_seconds": (
-                        RAMP_LATENCY_THRESHOLD_SECONDS
-                    ),
-                },
-                "client_concurrency_ceiling": MAX_WORKERS,
-                "break_was_client_limited": metrics["client_limited"],
-            }
-            print(
-                f"Breaking point found at {offered_rps} req/s: "
-                f"{result['breaking_reason']}"
+        steps.append(metrics)
+        final_metrics = metrics
+
+        # Condition (b): a refused or reset socket means the API stopped
+        # accepting work. This outranks the failure-rate check because it names
+        # the actual cause of death.
+        if int(metrics.get("connection_failures", 0)) > 0:
+            breakdown = metrics.get("failure_breakdown") or {}
+            crash_rps = offered_rps
+            crash_reason = (
+                "Connection Refused"
+                if "connection_refused" in breakdown
+                else "Connection Error (API unreachable)"
             )
-            return result
+            print(f"CRASH: API unreachable at {offered_rps} req/s: {crash_reason}")
+            break
+
+        # Condition (a): every request in the step failed. Partial failures are
+        # deliberately not enough; the API has to be completely dead.
+        if int(metrics.get("failed", 0)) > 0 and int(metrics.get("successful", 0)) == 0:
+            crash_rps = offered_rps
+            crash_reason = _total_failure_reason(metrics)
+            print(f"CRASH: API dead at {offered_rps} req/s: {crash_reason}")
+            break
 
         last_successful_rps = offered_rps
         if offered_rps >= max_rps:
             break
-        offered_rps = min(offered_rps + step_increase, max_rps)
+        if step_increase is None:
+            offered_rps = min(offered_rps * 2, max_rps)
+        else:
+            offered_rps = min(offered_rps + step_increase, max_rps)
 
-    print(f"No breaking point up to {max_rps} req/s.")
+    stop_conditions = {
+        "stop_on_total_failure": True,
+        "stop_on_connection_error": True,
+        "failure_rate_percent": 100.0,
+    }
+
+    if crash_reason is not None:
+        result = {
+            "url": url,
+            "start_rps": start_rps,
+            "step_increase": step_increase,
+            "max_rps": max_rps,
+            "strategy": "double" if step_increase is None else "linear",
+            "found": True,
+            "breaking_rps": crash_rps,
+            "last_successful_rps": last_successful_rps,
+            "crash_reason": crash_reason,
+            # Alias kept for callers written before the ruthless ramp; both
+            # names describe the same stop event.
+            "breaking_reason": crash_reason,
+            "breaking_point": final_metrics,
+            "final_metrics": final_metrics,
+            "steps": steps,
+            "stop_conditions": stop_conditions,
+            "client_concurrency_ceiling": MAX_WORKERS,
+            "break_was_client_limited": bool(
+                final_metrics and final_metrics.get("client_limited")
+            ),
+        }
+        print(
+            f"BREAKING POINT: {crash_rps} req/s: {crash_reason} "
+            f"(last surviving rate: {last_successful_rps})"
+        )
+        return result
+
+    print(
+        f"API survived {max_rps} req/s offered load without a total crash "
+        f"(last surviving rate: {last_successful_rps})."
+    )
     return {
         "url": url,
         "start_rps": start_rps,
         "step_increase": step_increase,
         "max_rps": max_rps,
+        "strategy": "double" if step_increase is None else "linear",
         "found": False,
         "breaking_rps": None,
         "last_successful_rps": last_successful_rps,
-        "breaking_reason": f"no threshold breach up to {max_rps} req/s",
+        "crash_reason": None,
+        # Alias of crash_reason; both are null when nothing crashed.
+        "breaking_reason": None,
         "breaking_point": None,
+        "final_metrics": final_metrics,
         "steps": steps,
-        "thresholds": {
-            "failure_rate_percent": RAMP_FAILURE_THRESHOLD * 100,
-            "avg_latency_seconds": RAMP_LATENCY_THRESHOLD_SECONDS,
-            "end_to_end_avg_latency_seconds": RAMP_LATENCY_THRESHOLD_SECONDS,
-        },
+        "stop_conditions": stop_conditions,
         "client_concurrency_ceiling": MAX_WORKERS,
-        "break_was_client_limited": False,
+        "break_was_client_limited": bool(
+            final_metrics and final_metrics.get("client_limited")
+        ),
     }
 
 
