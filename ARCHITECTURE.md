@@ -33,6 +33,8 @@ feedback_loop.py    Staging verification: copy -> fix -> serve -> re-test -> com
 llm_client.py       Shared MODEL, BASE_URL and create_client() factory
 tools.py            run_load_test(url, total_requests) -> load metrics
                     run_full_diagnostic(url, total_requests) -> load + system metrics
+                    find_breaking_point(url, start_rps, step_increase, max_rps)
+                    -> breaking/last-clean RPS + per-step metrics
 profiler.py         get_system_metrics(duration_seconds) -> avg CPU/memory
 load_test_tool.py   Deprecated re-export of run_load_test (Phase 1 compatibility)
 dummy_api.py        FastAPI target: /health (instant), /slow (1.5 s sleep),
@@ -104,6 +106,16 @@ The assistant message containing `tool_calls` is appended before its tool
 results. OpenAI-compatible APIs reject a `tool` message whose `tool_call_id`
 does not belong to a preceding assistant turn.
 
+`find_breaking_point` is a second entry in the same loop, not a separate agent:
+`_execute_tool` dispatches by name, the tool's per-step JSON returns as the `tool`
+message, and the model explains it. Each step runs a paced one-second burst
+through the same 10-worker pool (`_run_ramp_step`), summarises HTTP latency,
+failures, and worker queue wait (`_summarize_ramp_burst`), and the loop stops at
+the first step that breaches 5% failures or 2.0 s end-to-end average latency.
+`ramp_ran` short-circuits the final answer before both the Audit report and the
+Local suggester: a capacity report has no `load_test` payload for the audit
+builder and no bottleneck that justifies a code fix.
+
 ## Modes: Local vs Remote Audit
 
 The measured URL decides what happens after the tool loop. There are two modes:
@@ -131,6 +143,11 @@ first URL in prompt ──► loopback? ──► yes ──► Local mode
 - `mode=MODE_LOCAL|MODE_AUDIT` forces a mode for callers and tests; any other
   value raises `ValueError`. The CLI does not expose a flag because the URL is
   already the input that determines the mode.
+- Ramp-up is mode-independent: both system prompts advertise
+  `find_breaking_point`, and a completed ramp returns the model's capacity
+  analysis directly. It never reaches the remote audit builder (which would look
+  for a missing `load_test` and report `Inconclusive`) or the local suggester
+  (a breaking point is a capacity limit, not necessarily a code defect).
 
 The Audit verdict is computed, not generated:
 
@@ -161,6 +178,25 @@ Schema advertised to the model:
       "total_requests": { "type": "integer", "minimum": 1 }
     },
     "required": ["url", "total_requests"]
+  }
+}
+```
+
+Ramp schema (only `url` is required; omitted rates use the function defaults
+`start_rps=10`, `step_increase=10`, `max_rps=100`):
+
+```json
+{
+  "name": "find_breaking_point",
+  "parameters": {
+    "type": "object",
+    "properties": {
+      "url": { "type": "string" },
+      "start_rps": { "type": "integer", "minimum": 1 },
+      "step_increase": { "type": "integer", "minimum": 1 },
+      "max_rps": { "type": "integer", "minimum": 1 }
+    },
+    "required": ["url"]
   }
 }
 ```
@@ -219,6 +255,52 @@ percentiles cover every attempt (including timeouts, which then show up as the
 client deadline) and p95 uses nearest-rank, so in a 10-request test it is simply
 the slowest attempt.
 
+Ramp payload (the measured `/slow` run from the README):
+
+```json
+{
+  "url": "http://127.0.0.1:8000/slow",
+  "start_rps": 5,
+  "step_increase": 5,
+  "max_rps": 30,
+  "found": true,
+  "breaking_rps": 20,
+  "last_successful_rps": 15,
+  "breaking_reason": "end-to-end average latency 2.018s (HTTP 1.511s + client queue 0.507s) exceeded 2.0s",
+  "breaking_point": {
+    "offered_rps": 20,
+    "total_requests": 20,
+    "successful": 20,
+    "failed": 0,
+    "failure_rate_percent": 0.0,
+    "avg_latency_seconds": 1.511,
+    "p95_latency_seconds": 1.527,
+    "max_latency_seconds": 1.527,
+    "end_to_end_avg_latency_seconds": 2.018,
+    "client_queue_avg_seconds": 0.507,
+    "client_queue_max_seconds": 1.028,
+    "client_limited": true
+  },
+  "steps": [],
+  "thresholds": {
+    "failure_rate_percent": 5.0,
+    "avg_latency_seconds": 2.0,
+    "end_to_end_avg_latency_seconds": 2.0
+  },
+  "client_concurrency_ceiling": 10,
+  "break_was_client_limited": true
+}
+```
+
+`avg_latency_seconds` is HTTP time only. `end_to_end_avg_latency_seconds` adds
+`client_queue_avg_seconds`, the wait before one of the 10 workers starts the
+request, and that end-to-end figure is what the 2.0 s ramp threshold checks. The
+split is what lets the report say "the API was still at 1.51 s, but the client
+queue pushed the observed wait to 2.018 s" instead of attributing generator
+queueing to the server. When no step breaches, the payload has `found: false`,
+`breaking_rps: null`, `breaking_point: null`, and `last_successful_rps` set to
+`max_rps`.
+
 A success is an HTTP `200` response inside the client deadline. The interactive
 default is 3 seconds; `run_full_diagnostic` passes
 `DIAGNOSTIC_TIMEOUT_SECONDS = 15` because a CPU-bound handler legitimately takes
@@ -230,8 +312,8 @@ arguments are returned as `{"error": "..."}` so the model can self-correct.
 
 
 `run_load_test(url, total_requests)` remains available for latency-only runs
-and for the deprecated `load_test_tool.py` compatibility module; the agent only
-advertises `run_full_diagnostic`.
+and for the deprecated `load_test_tool.py` compatibility module; the agent
+advertises `run_full_diagnostic` and `find_breaking_point`.
 
 ## Profiler (`profiler.py`)
 
@@ -489,11 +571,25 @@ the API key never enters source control or tool output.
 - **Failures outrank latency.** One HTTP 500 is `Broken` even when p95 is 50 ms,
   because a fast error is still an outage. Treating "most requests succeeded" as
   healthy would hide partial failures, which are the common remote symptom.
+- **Ramp-up is a sequence of measured steps, not a guessed capacity number.**
+  Each rate is offered for a full second and summarised before the next rate is
+  tried, so `last_successful_rps` is the last rate with evidence behind it. The
+  thresholds live in `tools.py`, and `breaking_reason` names the exact metric and
+  value that ended the ramp.
+- **A client-limited break is labelled, not hidden.** The fixed 10-worker pool is
+  sufficient for the bursts used in Phases 1-6, but a 1.5 s handler cannot exceed
+  roughly 6.7 completed req/s through it. The ramp therefore measures end-to-end
+  latency for the threshold while preserving HTTP latency separately and setting
+  `client_limited`. Reporting only the breaking RPS would turn a generator
+  ceiling into a false server-capacity claim; reporting only "no break" would
+  ignore the latency a client actually experienced.
 
 ## Known limitations
 
 - No persistence: each run's metrics are printed and discarded.
-- No rate limiting, ramp-up, or workload scenarios — a single burst only.
+- No configurable rate limiting or workload scenarios. Ramp-up is a fixed policy
+  (one second per step, 5% failures, 2.0 s end-to-end latency), and each step is a
+  separate burst rather than a sustained test.
 - Synchronous request path; the orchestrator blocks until the model answers.
 - CPU/memory are machine-wide and sampled on a fixed window, not per-process and
   not per-request; a load test longer than the window is only partially covered.
@@ -521,6 +617,10 @@ the API key never enters source control or tool output.
   logs, traces, per-process CPU, or downstream timings. Its CPU/memory readings
   describe the local client, not the remote server, so they are context only. The
   2.0 s p95 threshold is a fixed policy default, not a per-target SLO.
+- Ramp-up shares the fixed 10-worker client, so on a high-latency endpoint the
+  generator can queue before the server saturates. `client_limited` and
+  `client_queue_avg_seconds` make that explicit, but a client-limited
+  `breaking_rps` is a lower bound and cannot prove the server's true capacity.
 
 - The target API is a local FastAPI app with no database, so database bottleneck
   detection still depends on future target-side instrumentation.

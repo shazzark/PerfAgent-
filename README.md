@@ -84,8 +84,8 @@ then verify the fix by re-running the same test.
 
 PerfAgent is a tool-calling loop built on the OpenAI Python SDK:
 
-1. The orchestrator sends your prompt, a system prompt, and the
-   `run_full_diagnostic` tool schema to the model.
+1. The orchestrator sends your prompt, a system prompt, and the tool schemas
+   (`run_full_diagnostic` and `find_breaking_point`) to the model.
 2. If the model requests the tool, the orchestrator executes it locally and
    returns the JSON result as a `tool` message.
 3. The model analyses the metrics and either asks for another tool call or
@@ -134,10 +134,20 @@ requests per second, and average/peak CPU and memory percentages for the same ru
 alongside a 2 s idle baseline and the load-minus-baseline deltas. `run_load_test`
 remains available for latency-only runs with its 3 s interactive deadline.
 
+The second tool, `find_breaking_point(url, start_rps, step_increase, max_rps)`,
+offers a constant request rate for one second per step and raises the rate after
+each clean step. A step breaks the ramp when more than 5% of its requests fail or
+its end-to-end average latency (HTTP time plus any wait for a generator worker)
+exceeds 2.0 s. It returns `breaking_rps`, `last_successful_rps`, the metrics at
+the breaking step, and every attempted step. The payload keeps API latency and
+client queue wait separate and sets `client_limited` when the fixed 10-worker
+generator is the queue, so a report never silently presents the generator's
+ceiling as the server's.
+
 
 ## Status
 
-Phases 1–6 are complete. Phase 4 — **AI Analysis & Suggestion** — was verified
+Phases 1–7 are complete. Phase 4 — **AI Analysis & Suggestion** — was verified
 end to end: a 12-request burst on `/heavy` raised CPU from a 31.7% idle baseline
 to a 91.1% peak (+27.8 points) while memory stayed flat, and the model named the
 handler CPU-bound. Phase 4.5 injects the target's source code, which resolved
@@ -159,6 +169,15 @@ non-loopback target is load-tested and classified as `Broken`, `Degraded`,
 `Stable`, or `Inconclusive` from the measured failures and p95 latency; the
 source/suggester/staging path is structurally bypassed. The verdict is computed
 by `agent.build_audit_report`, so model prose cannot turn a failing API green.
+
+Phase 7 — **Ramp-Up / Breaking Point** — adds `find_breaking_point`. It ramps
+offered load in one-second steps until a step exceeds 5% failures or 2.0 s
+end-to-end average latency, then reports the breaking rate, the last clean rate,
+and the metrics at the breaking step. A live run against `/slow` (1.5 s handler,
+`start_rps=5`, `max_rps=30`, `step_increase=5`) stopped at 20 RPS: HTTP latency
+was still 1.511 s, but 0.507 s of client queue pushed end-to-end latency to
+2.018 s. The payload flagged `client_limited: true`, and the agent reported 20
+RPS as a lower bound rather than claiming the server itself had failed.
 
 
 ## Requirements
@@ -323,6 +342,55 @@ A model-authored `**Verdict:**` line is removed and regenerated, and any
 figures describe the machine running the load generator, not the remote server, so
 they are reported as context rather than as evidence about the target.
 
+### Finding the breaking point (ramp-up)
+
+Ask for the breaking point or capacity limit and the model calls
+`find_breaking_point`, not the fixed-burst diagnostic:
+
+```powershell
+py agent.py "Find the breaking point for http://127.0.0.1:8000/slow with start_rps=5 and max_rps=30. Use step_increase=5 so I can see each 5 RPS step."
+```
+
+The tool offers `rps` requests over one second, paced `1/rps` apart, then raises
+the rate by `step_increase`. It stops at the first step where either:
+
+- the failure rate is above **5%**, or
+- the **end-to-end average latency** is above **2.0 s**. End-to-end means HTTP
+  latency plus any time a request waited for one of the generator's 10 workers.
+
+A live run against `/slow` stopped at 20 RPS:
+
+| Step (RPS) | Success | API avg latency | End-to-end avg | Client queue avg | Client limited? |
+| --- | --- | --- | --- | --- | --- |
+| 5 | 100% | 1.521 s | 1.521 s | 0.000 s | No |
+| 10 | 100% | 1.514 s | 1.514 s | 0.000 s | No |
+| 15 | 100% | 1.512 s | 1.792 s | 0.280 s | Yes |
+| **20** | 100% | 1.511 s | **2.018 s** | 0.507 s | Yes |
+
+The agent's conclusion from that run:
+
+> The API survived the last clean step at **15 RPS** (end-to-end latency ≈ 1.79 s).
+> At **20 RPS** the client-side queue caused the end-to-end latency to exceed 2 s,
+> so the breaking point is **≥ 20 RPS** but not definitively higher because the
+> load generator was saturated.
+
+The result is deliberately explicit about what broke:
+
+- `breaking_rps`: the first rate that crossed a threshold (`20` above).
+- `last_successful_rps`: the last clean rate (`15`).
+- `breaking_point`: full metrics for the failing step, including both
+  `avg_latency_seconds` (HTTP only) and `end_to_end_avg_latency_seconds`.
+- `client_queue_avg_seconds` / `client_queue_max_seconds`: time spent waiting for
+  a generator worker, never folded into the API latency.
+- `client_limited`: `true` when the 10-worker generator was the queue, which makes
+  the reported rate a **lower bound**, not proof of server capacity.
+- `steps`: every attempted step, so the table above is reproducible.
+- `found: false` and `breaking_rps: null` when the API survives `max_rps`.
+
+A larger `max_rps` does not remove the generator ceiling. To measure a genuinely
+high-capacity API, raise the worker count or use a dedicated load generator; the
+current tool reports the limit it can prove and labels the client-side share.
+
 The remediation stage has its own smoke test, which spends exactly one model call
 on a canned CPU-bound diagnosis against a small FastAPI source snippet:
 
@@ -349,7 +417,7 @@ PerfAgent/
 ├── suggester.py        suggest_code_fix() + suggest_staged_file() - one model call each
 ├── feedback_loop.py    Staging copy, restart cycle, before/after comparison
 ├── llm_client.py       Shared model id, base URL, and client factory
-├── tools.py            run_load_test() and run_full_diagnostic()
+├── tools.py            run_load_test(), run_full_diagnostic(), find_breaking_point()
 ├── profiler.py         get_system_metrics() - CPU/memory sampling via psutil
 ├── load_test_tool.py   Deprecated re-export kept for Phase 1 compatibility
 ├── dummy_api.py        FastAPI target: /health, /slow (sleep), /heavy (CPU-bound)
@@ -377,6 +445,10 @@ PerfAgent/
 | `system_metrics.cpu_samples` / `memory_samples` | The per-second series behind the averages |
 | `cpu_delta_percent` / `memory_delta_percent` | Load average minus baseline average |
 | `profile_covers_full_load_test` | `false` when the load test outlasted the sampling window |
+| `find_breaking_point` -> `breaking_rps` / `last_successful_rps` | First rate that crossed a threshold, and the last rate that did not |
+| `breaking_point.avg_latency_seconds` | HTTP-only per-request latency at the breaking step |
+| `breaking_point.end_to_end_avg_latency_seconds` | HTTP latency plus generator queue wait; this is what the 2.0 s ramp threshold checks |
+| `breaking_point.client_limited` | `true` when the fixed 10-worker generator was the bottleneck, making the rate a lower bound |
 
 Read them together: high latency with high CPU points at a CPU-bound handler;
 high latency with low CPU points at sleeping, blocking I/O, or a downstream
@@ -399,13 +471,17 @@ rounds are the only conditions that abort a run.
 5. **Feedback Loop — completed.** Apply the fix to a staging copy, re-test, compare.
 6. **Remote Audit — completed.** Measure a live non-localhost API and report
    Broken/Degraded/Stable without reading source or suggesting a fix.
+7. **Ramp-Up / Breaking Point — completed.** Increase offered RPS per step until
+   failure rate or end-to-end latency crosses policy, and report the breaking
+   and last-clean rates with an explicit client-limit flag.
 
 Full detail and checklists live in [ROADMAP.md](ROADMAP.md); technical decisions
 are in [ARCHITECTURE.md](ARCHITECTURE.md).
 
 ## Limitations
 
-- Single-burst load only — no ramp-up, duration, or mixed scenarios.
+- Ramp-up is a fixed policy: one second per step, 5% failures, 2.0 s end-to-end
+  latency. It is not a negotiated SLO and does not run mixed scenarios.
 - No result persistence or comparison between runs yet.
 - Suggested fixes are model output, and only the file that declares the measured
   route is ever staged. Verification covers one endpoint, one burst size, and one
@@ -428,6 +504,10 @@ are in [ARCHITECTURE.md](ARCHITECTURE.md).
   logs, traces, per-process CPU, or downstream timing are available. The CPU and
   memory deltas describe the load generator's host, not the remote server, and
   the 2.0 s p95 threshold is a fixed policy default rather than a negotiated SLO.
+- Ramp-up uses the same 10-worker client as a burst. On a high-latency endpoint the
+  generator can become the bottleneck before the server does; `client_limited`
+  and `client_queue_avg_seconds` expose that, and a client-limited
+  `breaking_rps` is a lower bound rather than a server capacity measurement.
 
 
 ## Security notes

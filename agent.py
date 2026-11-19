@@ -1,9 +1,12 @@
-"""PerfAgent orchestrator - Phase 4 analysis plus Phase 6 remote Audit mode.
+"""PerfAgent orchestrator - analysis, remote Audit mode, and ramp-up testing.
 
 The orchestrator is one LLM tool-calling loop followed by a mode-specific step:
+`run_full_diagnostic` measures a fixed burst, and `find_breaking_point` ramps
+offered load until the API crosses a failure or latency threshold.
 
 Local mode (the target is loopback):
-1. Send the user's goal, plus the `run_full_diagnostic` tool schema, to Groq.
+1. Send the user's goal, plus the `run_full_diagnostic` and
+   `find_breaking_point` tool schemas, to Groq.
 2. If the model asks for the tool, execute it locally (load test + CPU/memory
    profiling) and feed the JSON result back as a `tool` message.
 3. Repeat until the model answers without requesting another tool. That answer
@@ -34,6 +37,7 @@ Usage:
     py agent.py --source path/to/app.py "Diagnose http://host:8000/heavy"
     py agent.py --verify "Diagnose http://127.0.0.1:8000/heavy"   # skip the prompt
     py agent.py "Audit https://httpbin.org/status/500 with 5 requests"
+    py agent.py "Find the breaking point for http://127.0.0.1:8000/slow from 5 to 30 RPS"
     py agent.py            # runs the built-in demo prompt
 """
 
@@ -51,7 +55,7 @@ from openai import OpenAI
 from feedback_loop import format_comparison, run_feedback_loop
 from llm_client import MODEL, create_client
 from suggester import SUGGESTION_HEADING, suggest_code_fix
-from tools import run_full_diagnostic
+from tools import find_breaking_point, run_full_diagnostic
 
 # Safety valve: a well-behaved model needs one round to call the tool and one
 # to explain the result. Anything beyond this is a loop and should fail loudly.
@@ -104,6 +108,16 @@ SYSTEM_PROMPT = (
     "Whenever the user asks you to measure, test, benchmark, or diagnose an "
     "endpoint, you must call the run_full_diagnostic tool instead of estimating "
     "results yourself. "
+    "If the user asks to find the breaking point or test the capacity limits, "
+    "use the find_breaking_point tool instead of run_full_diagnostic. Explain "
+    "the results clearly, telling the user exactly at what RPS the API broke "
+    "and what the latency was at that point. If breaking_rps is null, say the "
+    "API survived max_rps and report the last successful rate. If "
+    "break_was_client_limited is true, say the 10-worker load generator was "
+    "queueing, so the breaking point is a lower bound rather than proof of "
+    "server capacity. The latency threshold uses end-to-end average latency, "
+    "which includes that client queue wait; report the API's own "
+    "avg_latency_seconds separately. "
     "That tool load-tests the endpoint while sampling machine CPU and memory, and "
     "it also samples a two second idle baseline immediately before the test. "
     "Never invent latency, throughput, CPU, memory, or failure numbers. "
@@ -169,6 +183,13 @@ AUDIT_SYSTEM_PROMPT = (
     "memory and returns latency, success/failure counts, throughput, and an idle "
     "baseline. Never invent latency, throughput, CPU, memory, or failure "
     "numbers. If the target URL is missing, ask the user for it.\n"
+    "If the user asks for the breaking point or capacity limits, call "
+    "find_breaking_point instead. Report breaking_rps, last_successful_rps, the "
+    "failure rate and latency at that step, and say when break_was_client_limited "
+    "means the 10-worker generator was the queue, so the rate is a lower bound. "
+    "The threshold uses end-to-end latency including that queue wait; report the "
+    "API's own avg_latency_seconds separately. Do not suggest a fix for a "
+    "capacity limit either.\n"
     "After the tool returns, classify the API and state the verdict explicitly:\n"
     "- Broken: any request failed (load_test.failed > 0). A timeout, a "
     "connection error, or any non-200 status is a failure, so the API is not "
@@ -410,7 +431,58 @@ TOOLS: list[dict[str, Any]] = [
                 "additionalProperties": False,
             },
         },
-    }
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "find_breaking_point",
+            "description": (
+                "Find the request rate at which an API breaks. Ramps offered load "
+                "from start_rps to max_rps in step_increase increments, running a "
+                "one-second burst at each rate. Stops at the first step where more "
+                "than 5% of requests fail or end-to-end average latency (HTTP "
+                "time plus any client queue wait) exceeds 2.0 seconds. "
+                "Returns breaking_rps, last_successful_rps, the metrics at the "
+                "breaking step, every attempted step, and whether the 10-worker "
+                "load generator itself was queueing (client_limited). Use this "
+                "when the user asks for capacity limits or a breaking point."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "url": {
+                        "type": "string",
+                        "description": (
+                            "Absolute URL to ramp, including scheme and port "
+                            "(for example http://127.0.0.1:8000/slow)."
+                        ),
+                    },
+                    "start_rps": {
+                        "type": "integer",
+                        "description": "First offered request rate. Minimum 1.",
+                        "minimum": 1,
+                    },
+                    "step_increase": {
+                        "type": "integer",
+                        "description": (
+                            "RPS added after each clean step. Minimum 1."
+                        ),
+                        "minimum": 1,
+                    },
+                    "max_rps": {
+                        "type": "integer",
+                        "description": (
+                            "Highest offered rate to try before giving up. "
+                            "Must be at least start_rps."
+                        ),
+                        "minimum": 1,
+                    },
+                },
+                "required": ["url"],
+                "additionalProperties": False,
+            },
+        },
+    },
 ]
 
 
@@ -424,18 +496,39 @@ def _parse_arguments(raw_arguments: str) -> dict[str, Any]:
     return parsed if isinstance(parsed, dict) else {}
 
 
+def _integer_argument(
+    arguments: dict[str, Any], key: str, default: int
+) -> int:
+    """Read an integer tool argument, rejecting booleans and non-numeric text."""
+    value = arguments.get(key, default)
+    if isinstance(value, bool):
+        raise ValueError(f"{key} must be an integer")
+    return int(value)
+
+
 def _execute_tool(name: str, arguments: dict[str, Any]) -> dict[str, Any]:
     """Run a tool by name and return a JSON-serialisable result.
 
     Tool failures are returned as data rather than raised so the model can
     correct its arguments or report the problem instead of crashing the run.
     """
-    if name != "run_full_diagnostic":
+    if name not in {"run_full_diagnostic", "find_breaking_point"}:
         return {"error": f"Unknown tool: {name}"}
 
     url = arguments.get("url")
     if not isinstance(url, str) or not url:
-        return {"error": "run_full_diagnostic requires a non-empty 'url' argument"}
+        return {"error": f"{name} requires a non-empty 'url' argument"}
+
+    if name == "find_breaking_point":
+        try:
+            return find_breaking_point(
+                url=url,
+                start_rps=_integer_argument(arguments, "start_rps", 10),
+                step_increase=_integer_argument(arguments, "step_increase", 10),
+                max_rps=_integer_argument(arguments, "max_rps", 100),
+            )
+        except (TypeError, ValueError) as exc:
+            return {"error": f"Invalid arguments for find_breaking_point: {exc}"}
 
     try:
         total_requests = int(arguments.get("total_requests", 10))
@@ -721,6 +814,8 @@ def run_agent(
     diagnostic_ran = False
     diagnostic_url: str | None = None
     diagnostic_result: dict[str, Any] = {}
+    ramp_ran = False
+    ramp_result: dict[str, Any] = {}
     mode_switched = False
 
     for _round in range(1, MAX_TOOL_ROUNDS + 1):
@@ -738,6 +833,17 @@ def run_agent(
                 answer = "(the model returned an empty response)"
                 print(f"🤖 PerfAgent: {answer}")
                 return answer
+            if ramp_ran:
+                # A capacity ramp is its own report. Sending it through the
+                # audit builder would look for `load_test` and wrongly call the
+                # run Inconclusive, while the local path would ask for a code fix
+                # when the user only asked where capacity ends.
+                print(
+                    "🤖 PerfAgent (breaking point analysis, measured "
+                    f"breaking_rps={ramp_result.get('breaking_rps')}):\n"
+                    f"{analysis}"
+                )
+                return analysis
             if audit_mode:
                 # Strict remote audit: the report is built from the measurements
                 # and the model's prose. No source lookup, no suggester, no patch.
@@ -779,6 +885,9 @@ def run_agent(
 
             result = _execute_tool(name, arguments)
             print(f"   ↳ Result: {json.dumps(result)}")
+            if name == "find_breaking_point":
+                ramp_ran = True
+                ramp_result = result
             # Only a diagnostic that actually produced load numbers justifies a
             # remediation; a failed run has no measured bottleneck to explain.
             # The failed payload is still kept so Audit mode can explain it.
