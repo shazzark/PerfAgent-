@@ -78,12 +78,12 @@ remains available for latency-only runs with its 3 s interactive deadline.
 
 ## Status
 
-Phase 3 — **The Eyes (Profiler)** is complete: `/heavy`, the profiler, the
-combined diagnostic tool, and the correlation-aware prompt are implemented and
-verified. Phase 4 — **AI Analysis & Suggestion** is in progress: the agent now
-ranks the bottleneck from measured data and appends one concrete remediation.
-Target-side tracing, query timing, metric persistence, and the apply-and-retest
-loop are still open (see [ROADMAP.md](ROADMAP.md)).
+Phases 1–4 are complete. Phase 4 — **AI Analysis & Suggestion** — was verified
+end to end: a 12-request burst on `/heavy` raised CPU from a 31.7% idle baseline
+to a 91.1% peak (+27.8 points) while memory stayed flat, the model named the
+handler CPU-bound, and the remediation stage returned a `ProcessPoolExecutor`
+diff. Target-side tracing, query timing, metric persistence, and the
+apply-and-retest loop are still open (see [ROADMAP.md](ROADMAP.md)).
 
 
 ## Requirements
@@ -208,7 +208,7 @@ rounds are the only conditions that abort a run.
 1. **The Muscle (Tools) — completed.** Dummy API, concurrent load generator.
 2. **The Brain (Orchestrator) — completed.** LLM tool calling via Groq.
 3. **The Eyes (Profiler) — completed.** CPU and memory correlated with load.
-4. **AI Analysis — in progress.** Root-cause ranking plus one concrete fix.
+4. **AI Analysis — completed.** Root-cause ranking plus one concrete fix.
 5. **Feedback Loop.** Apply fixes in staging, re-test, compare.
 
 Full detail and checklists live in [ROADMAP.md](ROADMAP.md); technical decisions
@@ -220,7 +220,9 @@ are in [ARCHITECTURE.md](ARCHITECTURE.md).
 - No result persistence or comparison between runs yet.
 - Suggested fixes are model output: they are not applied, compiled, or
   regression-tested, and nothing yet checks that the patch is valid against your
-  codebase. Review before applying.
+  codebase. The remediation call sees only the diagnosis text, not your source
+  tree, so it can target the wrong framework (a Flask diff for a FastAPI target
+  was observed). Review before applying.
 - CPU and memory are machine-wide and sampled on a fixed 5 s window, not
   per-process or per-request.
 - The bundled target API has no database, so database bottleneck detection

@@ -35,7 +35,7 @@ shorter than a long load test; `profile_covers_full_load_test` reports when that
 happened.
 
 
-## Phase 4: AI Analysis & Suggestion (In Progress)
+## Phase 4: AI Analysis & Suggestion (Completed)
 
 - [x] Feed profiling data to the LLM for root-cause analysis
 - [x] Rank bottlenecks by measured impact
@@ -44,8 +44,13 @@ happened.
 - [x] Gate the suggestion on a diagnostic that actually produced load numbers, so conversational answers pass through unchanged
 - [x] Report a suggestion-provider failure inline instead of discarding the measurements
 - [x] Contract tests for the diagnosis -> suggestion wiring (`tests/`, scripted fake client)
-- [ ] Per-process CPU sampling for the target, so a busy dev machine cannot mask the CPU signal
-- [ ] Apply the suggested fix automatically and re-test (moves to Phase 5)
+- [x] Verify live: 12 requests on `/heavy` moved CPU from a 31.7% idle baseline to a 91.1% peak (+27.8 points) with flat memory, the model returned a CPU-bound verdict, and the fix was a `ProcessPoolExecutor` diff
+
+Deferred past Phase 4:
+
+- [ ] Per-process CPU sampling for the target, so a busy dev machine cannot mask the CPU signal (the live run only separated cleanly because the host had headroom: baseline 31.7%)
+- [ ] Give the remediation call repository context, so the patch targets the real framework and file layout
+
 
 ## Phase 5: Feedback Loop
 

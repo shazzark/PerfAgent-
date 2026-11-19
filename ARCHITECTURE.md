@@ -289,7 +289,9 @@ the API key never enters source control or tool output.
   cannot separate the target process from unrelated software. Process-scoped
   sampling (`psutil.Process(pid)`) is the tracked fix.
 - Suggested fixes are model output: nothing applies, compiles, or regression-tests
-  them, and the remediation call sees only the diagnosis text, not the repository.
+  them, and the remediation call sees only the diagnosis text, not the repository,
+  so it can name the wrong framework or file.
+
 - The target API is a local FastAPI app with no database, so database bottleneck
   detection still depends on future target-side instrumentation.
 
