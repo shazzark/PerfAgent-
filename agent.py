@@ -1,16 +1,30 @@
-"""PerfAgent orchestrator - Phase 4: AI Analysis & Suggestion.
+"""PerfAgent orchestrator - Phase 4 analysis plus Phase 6 remote Audit mode.
 
-The orchestrator is one LLM tool-calling loop followed by one remediation call:
+The orchestrator is one LLM tool-calling loop followed by a mode-specific step:
 
+Local mode (the target is loopback):
 1. Send the user's goal, plus the `run_full_diagnostic` tool schema, to Groq.
 2. If the model asks for the tool, execute it locally (load test + CPU/memory
    profiling) and feed the JSON result back as a `tool` message.
 3. Repeat until the model answers without requesting another tool. That answer
    is the diagnosis.
-4. If a diagnostic actually ran, resolve the file that declares the measured
-   route, read it, and call `suggester.suggest_code_fix(diagnosis, source)`, so
-   the fix is written against the real framework instead of a guess. The answer
-   is the diagnosis plus one concrete code/infrastructure fix.
+4. Resolve the file that declares the measured route, read it, and call
+   `suggester.suggest_code_fix(diagnosis, source)`, so the fix is written
+   against the real framework instead of a guess. The answer is the diagnosis
+   plus one concrete code/infrastructure fix, optionally verified on staging.
+
+Remote Audit mode (the target is any non-loopback host):
+1. The same tool loop measures the API.
+2. The model audits it instead of diagnosing code it cannot see: no source
+   lookup, no `suggester.suggest_code_fix`, no patch, no staging.
+3. `build_audit_report` adds a deterministic verdict (`Broken`, `Degraded`,
+   `Stable`, or `Inconclusive`) so a model that forgets the rule cannot hide a
+   broken API. Failed requests and p95 latency above 2 seconds are the audit
+   thresholds.
+
+Mode is selected from the first URL in the prompt; if the prompt has no URL,
+the URL the diagnostic actually measured decides, and the run switches to Audit
+mode before the final answer.
 
 Groq exposes an OpenAI-compatible API, so the official `openai` SDK is used
 with `base_url` pointing at `https://api.groq.com/openai/v1`.
@@ -19,9 +33,11 @@ Usage:
     py agent.py "Diagnose http://127.0.0.1:8000/heavy with 12 requests"
     py agent.py --source path/to/app.py "Diagnose http://host:8000/heavy"
     py agent.py --verify "Diagnose http://127.0.0.1:8000/heavy"   # skip the prompt
+    py agent.py "Audit https://httpbin.org/status/500 with 5 requests"
     py agent.py            # runs the built-in demo prompt
 """
 
+import ipaddress
 import json
 import os
 import re
@@ -122,6 +138,239 @@ SYSTEM_PROMPT = (
     "remediation plan: a separate step turns this diagnosis into one concrete "
     "fix, so the diagnosis is all that is needed here."
 )
+
+# Two operating modes. Local mode may read source and propose a fix because the
+# target runs on this machine. Remote targets expose no source and must never
+# receive a patch the agent cannot verify, so they are audited instead.
+MODE_LOCAL = "local"
+MODE_AUDIT = "audit"
+
+AUDIT_VERDICT_BROKEN = "Broken"
+AUDIT_VERDICT_DEGRADED = "Degraded"
+AUDIT_VERDICT_STABLE = "Stable"
+AUDIT_VERDICT_UNKNOWN = "Inconclusive"
+
+# Audit thresholds are policy, not a measured SLO: any failed request means the
+# API is not serving reliably, and a p95 above two seconds means it answers too
+# slowly under load. Keeping them in code (not only in the prompt) makes the
+# verdict reproducible even when the model is vague.
+AUDIT_P95_THRESHOLD_SECONDS = 2.0
+
+# System prompt for targets that are not on this machine. It deliberately has no
+# source-code or remediation stage: an audit describes health, it does not patch
+# a service the agent cannot see.
+AUDIT_SYSTEM_PROMPT = (
+    "You are PerfAgent in REMOTE AUDIT mode. The target API does not run on this "
+    "machine, so you are a read-only auditor: measure its health and report what "
+    "the numbers prove. You cannot see, read, or change its source code.\n"
+    "Whenever the user asks you to measure, test, benchmark, or audit an "
+    "endpoint, you must call the run_full_diagnostic tool instead of estimating "
+    "results yourself. The tool load-tests the endpoint while sampling CPU and "
+    "memory and returns latency, success/failure counts, throughput, and an idle "
+    "baseline. Never invent latency, throughput, CPU, memory, or failure "
+    "numbers. If the target URL is missing, ask the user for it.\n"
+    "After the tool returns, classify the API and state the verdict explicitly:\n"
+    "- Broken: any request failed (load_test.failed > 0). A timeout, a "
+    "connection error, or any non-200 status is a failure, so the API is not "
+    "serving reliably even when most requests succeeded.\n"
+    "- Degraded: no request failed, but load_test.p95_latency_seconds is above "
+    "2.0 seconds. The API answers, but too slowly under load.\n"
+    "- Stable: no request failed and p95_latency_seconds is at or below 2.0 "
+    "seconds.\n"
+    "Begin the answer with one line in exactly this form: '**Verdict:** Broken', "
+    "'**Verdict:** Degraded', or '**Verdict:** Stable'. Then report the failure "
+    "rate (failed / total attempts), successful and failed counts, average, p95 "
+    "and max latency, throughput, and the CPU and memory deltas. Name the "
+    "weakest points the measurement supports: error responses, timeouts, "
+    "saturation, unstable latency, or a slow downstream dependency. Rank them by "
+    "measured impact and keep the answer concise and technical.\n"
+    "Do NOT write code, a diff, a patch, a remediation plan, or a suggested fix. "
+    "Do NOT mention or look for local source files. Remote code is out of scope: "
+    "your job ends with the audit report.\n"
+    "If the diagnostic returns an error instead of load numbers, say the audit "
+    "is Inconclusive and explain what failed; never guess a verdict."
+)
+
+# Appended when the prompt had no URL and the tool measured a remote target, so
+# the model's final answer follows the audit rules even though the first system
+# prompt was the local one.
+AUDIT_MODE_NOTICE = (
+    "MODE CHANGE: the URL just measured is remote, so this run is now in REMOTE "
+    "AUDIT mode. Classify the API as Broken (any failed request), Degraded (no "
+    "failures but p95 latency above 2.0 seconds), or Stable (no failures and p95 "
+    "at or below 2.0 seconds), and report the verdict and failure rate. Do NOT "
+    "write code, a diff, a patch, or a suggested fix, and do NOT look for local "
+    "source files."
+)
+
+# Any heading the model might use if it ignores the audit instruction; the report
+# builder cuts the answer at the first match so a code fix cannot leak through.
+_SUGGESTION_SECTION = re.compile(
+    r"^[ \t]*(?:#{1,6}[ \t]*|\*\*)?Suggested[ \t]+Fix\b",
+    re.IGNORECASE | re.MULTILINE,
+)
+
+# A verdict line is regenerated from the measurements, so model-authored ones are
+# removed rather than trusted (a model can otherwise call a 100% failure "Stable").
+_MODEL_VERDICT_LINE = re.compile(
+    r"^[ \t]*\*\*Verdict:\*\*.*(?:\n|$)", re.IGNORECASE | re.MULTILINE
+)
+
+_URL_IN_TEXT = re.compile(r"https?://[^\s\"'<>]+", re.IGNORECASE)
+
+
+def _first_url(text: str) -> str | None:
+    """Return the first absolute URL in `text`, or None when there is none."""
+    match = _URL_IN_TEXT.search(text or "")
+    return match.group(0) if match else None
+
+
+def is_local_url(url: str | None) -> bool:
+    """True only for a loopback target that this agent could inspect locally.
+
+    Loopback is the narrow, defensible definition of "local": it is the one host
+    guaranteed to be this machine, so reading its source is meaningful. A private
+    LAN address is treated as remote because the code may live on another host.
+    """
+    if not isinstance(url, str) or not url.strip():
+        return False
+    host = urlparse(url).hostname
+    if not host:
+        return False
+    host = host.lower().rstrip(".")
+    if host == "localhost" or host.endswith(".localhost"):
+        return True
+    try:
+        return ipaddress.ip_address(host).is_loopback
+    except ValueError:
+        return False
+
+
+def detect_mode(user_prompt: str) -> str:
+    """Pick the operating mode from the first URL in the prompt.
+
+    With no URL the local prompt is used, because the agent has nothing to judge
+    yet. If the eventual measurement is remote, `run_agent` switches to Audit
+    mode before the final answer.
+    """
+    url = _first_url(user_prompt)
+    if url is None:
+        return MODE_LOCAL
+    return MODE_LOCAL if is_local_url(url) else MODE_AUDIT
+
+
+def _number(source: dict[str, Any], key: str) -> float:
+    """Read a numeric metric without letting a malformed payload crash a report."""
+    value = source.get(key, 0)
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return 0.0
+    return float(value)
+
+
+def classify_api_health(diagnostic_result: dict[str, Any]) -> tuple[str, str]:
+    """Return `(verdict, reason)` from a diagnostic payload.
+
+    This is the audit's source of truth: the verdict is derived from measured
+    failures and p95 latency, not from model judgement. `Inconclusive` is used
+    when no load numbers exist, because inventing a health verdict from an error
+    would be worse than admitting the audit could not run.
+    """
+    load_test = diagnostic_result.get("load_test")
+    if not isinstance(load_test, dict) or not load_test:
+        error = diagnostic_result.get("error") or "no load-test payload"
+        return (
+            AUDIT_VERDICT_UNKNOWN,
+            f"the diagnostic produced no measurements ({error})",
+        )
+
+    failed = int(_number(load_test, "failed"))
+    successful = int(_number(load_test, "successful"))
+    total = failed + successful
+    if total <= 0:
+        return AUDIT_VERDICT_UNKNOWN, "the diagnostic recorded no request attempts"
+
+    failure_rate = failed / total * 100
+    p95 = _number(load_test, "p95_latency_seconds")
+
+    if failed > 0:
+        return (
+            AUDIT_VERDICT_BROKEN,
+            f"{failed} of {total} requests failed ({failure_rate:.1f}% failure rate)",
+        )
+    if p95 > AUDIT_P95_THRESHOLD_SECONDS:
+        return (
+            AUDIT_VERDICT_DEGRADED,
+            f"no requests failed, but p95 latency was {p95:.2f} s "
+            f"(above the {AUDIT_P95_THRESHOLD_SECONDS:.2f} s threshold)",
+        )
+    return (
+        AUDIT_VERDICT_STABLE,
+        f"no requests failed and p95 latency was {p95:.2f} s "
+        f"(within the {AUDIT_P95_THRESHOLD_SECONDS:.2f} s threshold)",
+    )
+
+
+def _clean_audit_analysis(analysis: str) -> str:
+    """Remove model-authored verdicts and any suggested-fix section.
+
+    The prompt asks for both rules, but a strict audit must not depend on model
+    compliance: the computed verdict replaces the model's, and a trailing fix is
+    cut before it reaches the user.
+    """
+    text = _MODEL_VERDICT_LINE.sub("", analysis or "")
+    match = _SUGGESTION_SECTION.search(text)
+    if match:
+        text = text[: match.start()]
+    return text.strip()
+
+
+def build_audit_report(analysis: str, diagnostic_result: dict[str, Any]) -> str:
+    """Compose the Remote Audit Report from measurements plus model analysis.
+
+    The verdict, failure rate, and latency figures are generated here so the
+    report is complete even if the model's prose is vague or wrong. The model's
+    analysis remains the qualitative section: weak points and their ranking.
+    """
+    verdict, reason = classify_api_health(diagnostic_result)
+    load_test = diagnostic_result.get("load_test")
+    lines = ["## Audit Report", "", f"**Verdict:** {verdict}"]
+
+    if isinstance(load_test, dict) and load_test:
+        failed = int(_number(load_test, "failed"))
+        successful = int(_number(load_test, "successful"))
+        total = failed + successful
+        failure_rate = failed / total * 100 if total else 0.0
+        avg = _number(load_test, "avg_latency_seconds")
+        p95 = _number(load_test, "p95_latency_seconds")
+        maximum = _number(load_test, "max_latency_seconds")
+        throughput = _number(load_test, "requests_per_second")
+        target = diagnostic_result.get("url") or load_test.get("url")
+        cpu_delta = _number(diagnostic_result, "cpu_delta_percent")
+
+        lines.append("")
+        if target:
+            lines.append(f"- **Target:** {target}")
+        lines.extend(
+            [
+                f"- **Failure rate:** {failure_rate:.1f}% "
+                f"({failed} failed of {total})",
+                f"- **Latency:** avg {avg * 1000:.0f} ms, "
+                f"p95 {p95 * 1000:.0f} ms, max {maximum * 1000:.0f} ms",
+                f"- **Throughput:** {throughput:.2f} req/s",
+                # On a remote API these readings describe the load generator's
+                # host, not the server, so they are context rather than evidence
+                # about the target.
+                f"- **Local CPU delta:** {cpu_delta:+.2f} points "
+                "(load-generator host, not the remote server)",
+            ]
+        )
+
+    lines.extend(["", f"**Why:** {reason}", ""])
+    cleaned = _clean_audit_analysis(analysis)
+    if cleaned:
+        lines.extend(["### Analysis", "", cleaned])
+    return "\n".join(lines).strip()
+
 
 # The model reads this schema to decide whether and how to call the tool.
 TOOLS: list[dict[str, Any]] = [
@@ -422,32 +671,57 @@ def run_agent(
     client: OpenAI | None = None,
     source_file: str | Path | None = None,
     verify: bool | None = False,
+    mode: str | None = None,
 ) -> str:
-    """Resolve `user_prompt`, then turn the measured diagnosis into a fix.
+    """Measure `user_prompt`'s target, then fix it locally or audit it remotely.
 
-    The tool loop yields the diagnosis; the remediation call that follows is
-    what makes the run actionable. `diagnostic_ran` gates that second call, so a
-    purely conversational answer is returned unchanged instead of being sent off
-    for an unrelated patch, and the URL the tool actually measured is what seeds
-    the source-file lookup, so the fix is written against the file that was
-    really exercised. `source_file` overrides that lookup when the caller knows
-    the target.
-
-    Phase 5 appends the feedback loop. `verify=True` applies the fix to a local
-    staging copy and re-measures it, `verify=False` (the default for callers)
-    skips that, and `None` asks first - which the CLI does, but only in a real
+    Local mode (loopback target) yields a diagnosis, then resolves and reads the
+    measured route's file so `suggester.suggest_code_fix` can propose a concrete
+    fix against the real framework. Phase 5 optionally verifies that fix on a
+    staging copy: `verify=True` applies it, `verify=False` (the default for
+    callers) skips it, and `None` asks first - which the CLI does only in a real
     terminal, so a library caller or a piped run never blocks on `input()`.
+
+    Remote Audit mode (any non-loopback target) skips all of that. The final
+    answer is `build_audit_report`, whose verdict is computed from the measured
+    failures and p95 latency. No source lookup, no suggester call, and no staging
+    run: there is no local code to read and no safe way to apply a fix.
+
+    `mode` forces `MODE_LOCAL` or `MODE_AUDIT`; by default the first URL in the
+    prompt decides, and a remote URL measured later still switches the run to
+    Audit mode before the final answer.
     """
+    if mode is not None and mode not in {MODE_LOCAL, MODE_AUDIT}:
+        raise ValueError(f"unknown mode: {mode!r}")
+
     client = client or create_client()
+    audit_mode = (
+        mode == MODE_AUDIT
+        if mode is not None
+        else detect_mode(user_prompt) == MODE_AUDIT
+    )
     print(f"👤 User: {user_prompt}\n")
+    if audit_mode:
+        print(
+            "🔒 Remote Audit mode: measuring only; no source lookup, no code fix, "
+            "no staging verification."
+        )
+        if source_file:
+            print("↪️  --source is ignored in Audit mode (the target is remote).")
+        if verify:
+            print("↪️  --verify is ignored in Audit mode (nothing is applied).")
 
     messages: list[Any] = [
-        {"role": "system", "content": SYSTEM_PROMPT},
+        {
+            "role": "system",
+            "content": AUDIT_SYSTEM_PROMPT if audit_mode else SYSTEM_PROMPT,
+        },
         {"role": "user", "content": user_prompt},
     ]
     diagnostic_ran = False
     diagnostic_url: str | None = None
     diagnostic_result: dict[str, Any] = {}
+    mode_switched = False
 
     for _round in range(1, MAX_TOOL_ROUNDS + 1):
         response = client.chat.completions.create(
@@ -464,6 +738,15 @@ def run_agent(
                 answer = "(the model returned an empty response)"
                 print(f"🤖 PerfAgent: {answer}")
                 return answer
+            if audit_mode:
+                # Strict remote audit: the report is built from the measurements
+                # and the model's prose. No source lookup, no suggester, no patch.
+                # This runs even when the diagnostic failed, so an unreachable
+                # API is reported as Inconclusive rather than as a diagnosis.
+                report = build_audit_report(analysis, diagnostic_result)
+                print(f"🤖 PerfAgent (audit report):\n{report}")
+                return report
+
             if not diagnostic_ran:
                 # Nothing was measured, so there is no bottleneck to remediate.
                 print(f"🤖 PerfAgent: {analysis}")
@@ -498,10 +781,19 @@ def run_agent(
             print(f"   ↳ Result: {json.dumps(result)}")
             # Only a diagnostic that actually produced load numbers justifies a
             # remediation; a failed run has no measured bottleneck to explain.
-            if name == "run_full_diagnostic" and result.get("load_test"):
-                diagnostic_ran = True
+            # The failed payload is still kept so Audit mode can explain it.
+            if name == "run_full_diagnostic":
                 diagnostic_url = result.get("url") or arguments.get("url")
                 diagnostic_result = result
+                diagnostic_ran = bool(result.get("load_test"))
+                # The prompt may not have contained a URL. The measured target
+                # still decides the mode, so a remote run cannot fall through to
+                # the local source/suggester path.
+                if not audit_mode and diagnostic_url and not is_local_url(
+                    diagnostic_url
+                ):
+                    audit_mode = True
+                    mode_switched = True
 
             messages.append(
                 {
@@ -511,6 +803,14 @@ def run_agent(
                     "content": json.dumps(result),
                 }
             )
+
+        if mode_switched:
+            messages.append({"role": "system", "content": AUDIT_MODE_NOTICE})
+            print(
+                "🔒 Measured URL is remote; switching to Remote Audit mode "
+                "(no source lookup, no code fix)."
+            )
+            mode_switched = False
 
     raise RuntimeError(
         f"Model requested tools on {MAX_TOOL_ROUNDS} consecutive rounds without "

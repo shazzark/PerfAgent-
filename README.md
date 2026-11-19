@@ -6,8 +6,8 @@ the bottleneck is.**
 PerfAgent gives a large language model a real performance-testing tool instead
 of asking it to guess. You describe a target in plain English; the agent runs a
 concurrent load generator while sampling CPU and memory, then answers with an
-evidence-based read on performance and a concrete fix for the bottleneck it
-found.
+evidence-based read on performance and a concrete fix when the target runs on
+your machine, or a strictly measured health audit when it does not.
 
 ## Why this agent is safe
 
@@ -99,6 +99,16 @@ PerfAgent is a tool-calling loop built on the OpenAI Python SDK:
    job is a directly applicable diff, command, or statement written against the
    framework the code is actually built on.
 
+Mode is chosen per run. A loopback target (`localhost`, `127.0.0.1`, or `::1`) is
+treated as **Local** and gets the diagnosis -> fix -> optional verify path above.
+Any other host is treated as **Remote Audit**: the same tool measures it, but no
+source is resolved, `suggest_code_fix()` is never called, and nothing is staged.
+The answer is an **Audit Report** whose verdict is computed from the measured
+failures and p95 latency, not from the model's opinion. If the prompt contains no
+URL, the URL the tool actually measured decides, and a remote measurement switches
+the run to Audit mode before the final answer. `--source` and `--verify` are
+ignored in Audit mode.
+
 The remediation is *not* exposed to the model as a selectable tool: the
 orchestrator calls it deterministically once the diagnosis exists, so the fix is
 produced exactly once, always from the model's own final analysis, and never
@@ -127,7 +137,7 @@ remains available for latency-only runs with its 3 s interactive deadline.
 
 ## Status
 
-Phases 1–5 are complete. Phase 4 — **AI Analysis & Suggestion** — was verified
+Phases 1–6 are complete. Phase 4 — **AI Analysis & Suggestion** — was verified
 end to end: a 12-request burst on `/heavy` raised CPU from a 31.7% idle baseline
 to a 91.1% peak (+27.8 points) while memory stayed flat, and the model named the
 handler CPU-bound. Phase 4.5 injects the target's source code, which resolved
@@ -143,6 +153,12 @@ original server; `dummy_api.py` never changed. A confident-sounding fix that had
 never been measured is exactly what this phase exists to catch. Target-side
 tracing, query timing, and metric persistence are still open (see
 [ROADMAP.md](ROADMAP.md)).
+
+Phase 6 — **Remote Audit** — extends the agent to APIs it cannot inspect. A
+non-loopback target is load-tested and classified as `Broken`, `Degraded`,
+`Stable`, or `Inconclusive` from the measured failures and p95 latency; the
+source/suggester/staging path is structurally bypassed. The verdict is computed
+by `agent.build_audit_report`, so model prose cannot turn a failing API green.
 
 
 ## Requirements
@@ -252,6 +268,61 @@ and a new failed request always counts as a regression. The measured file is nev
 written — if the copy does not parse, does not assign `app`, or drops the measured
 route, the run is aborted before any server starts.
 
+### Auditing a live API
+
+Point the same command at a non-loopback host and the run becomes a read-only
+audit. No source is read, no fix is suggested, and nothing is staged:
+
+```powershell
+py agent.py "Audit https://httpbin.org/status/500 with 5 requests"
+```
+
+```text
+## Audit Report
+
+**Verdict:** Broken
+
+- **Target:** https://httpbin.org/status/500
+- **Failure rate:** 100.0% (5 failed of 5)
+- **Latency:** avg 2173 ms, p95 2199 ms, max 2199 ms
+- **Throughput:** 2.27 req/s
+- **Local CPU delta:** +5.91 points (load-generator host, not the remote server)
+
+**Why:** 5 of 5 requests failed (100.0% failure rate)
+
+### Analysis
+
+- Failure rate: 5 / 5 (100 %)
+- Successful requests: 0
+- Failed requests: 5
+- Avg latency: 2.173 s
+- P95 latency: 2.199 s
+- Max latency: 2.199 s
+- Throughput: 2.27 req/s
+- CPU delta: +5.91 % (peak 86.6 % vs idle 66.9 %)
+- Memory delta: +0.99 % (peak 91.4 % vs idle 89.3 %)
+
+**Weakest points (ranked):**
+1. **Error responses**: all requests returned HTTP 500, causing total failure.
+2. **Saturation**: despite low request count, the endpoint could not serve any
+   request, indicating a fundamental service outage.
+```
+
+The verdict is deterministic, so a model that calls a failing API "Stable" cannot
+change it:
+
+| Verdict | Condition |
+| --- | --- |
+| `Broken` | Any request failed (`load_test.failed > 0`) |
+| `Degraded` | No failures, but `p95_latency_seconds > 2.0` |
+| `Stable` | No failures, p95 at or below `2.0 s` |
+| `Inconclusive` | The diagnostic returned no load numbers (unreachable, timeout) |
+
+A model-authored `**Verdict:**` line is removed and regenerated, and any
+`Suggested Fix` section is cut before the report is returned. CPU and memory
+figures describe the machine running the load generator, not the remote server, so
+they are reported as context rather than as evidence about the target.
+
 The remediation stage has its own smoke test, which spends exactly one model call
 on a canned CPU-bound diagnosis against a small FastAPI source snippet:
 
@@ -273,7 +344,8 @@ py -m unittest discover -s tests -t . -v
 
 ```text
 PerfAgent/
-├── agent.py            Orchestrator: tool loop, source lookup, suggested fix, --verify
+├── agent.py            Orchestrator: tool loop, mode selection, source lookup,
+                    suggested fix, --verify, remote Audit Report
 ├── suggester.py        suggest_code_fix() + suggest_staged_file() - one model call each
 ├── feedback_loop.py    Staging copy, restart cycle, before/after comparison
 ├── llm_client.py       Shared model id, base URL, and client factory
@@ -325,6 +397,8 @@ rounds are the only conditions that abort a run.
 3. **The Eyes (Profiler) — completed.** CPU and memory correlated with load.
 4. **AI Analysis — completed.** Root-cause ranking plus one concrete fix.
 5. **Feedback Loop — completed.** Apply the fix to a staging copy, re-test, compare.
+6. **Remote Audit — completed.** Measure a live non-localhost API and report
+   Broken/Degraded/Stable without reading source or suggesting a fix.
 
 Full detail and checklists live in [ROADMAP.md](ROADMAP.md); technical decisions
 are in [ARCHITECTURE.md](ARCHITECTURE.md).
@@ -349,6 +423,11 @@ are in [ARCHITECTURE.md](ARCHITECTURE.md).
   depends on future target-side instrumentation.
 - The load generator runs in the same process as the agent; results are not
   clean benchmarks on a loaded machine.
+- Remote Audit mode measures one endpoint in one burst from this machine. It can
+  prove an API is failing or slow, but it cannot attribute the cause: no server
+  logs, traces, per-process CPU, or downstream timing are available. The CPU and
+  memory deltas describe the load generator's host, not the remote server, and
+  the 2.0 s p95 threshold is a fixed policy default rather than a negotiated SLO.
 
 
 ## Security notes

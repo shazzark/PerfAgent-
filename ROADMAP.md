@@ -93,3 +93,21 @@ Deferred past Phase 5:
 - [ ] Regression gate across the other endpoints, so a fix cannot trade one bottleneck for another
 - [ ] Persist each before/after pair next to the metrics it was computed from
 
+## Phase 6: Remote Audit (Completed)
+
+The first five phases assume the target runs on this machine: they can read its
+source, write a fix, and re-measure it. That assumption breaks for a live API,
+where the code is not available and a suggested patch cannot be verified. Phase 6
+adds the honest alternative: measure the API and report its health, without
+pretending to remediate code the agent cannot see.
+
+- [x] Mode selection: loopback targets (`localhost`, `127.0.0.1`, `::1`) keep the Local diagnosis/fix/verify path; every other host uses Audit mode
+- [x] Audit mode bypasses `source_file_for`, `load_source_context`, `suggest_code_fix` and `run_feedback_loop` structurally, not by asking the model to skip them
+- [x] Dedicated `AUDIT_SYSTEM_PROMPT` with no source-code or remediation stage
+- [x] Deterministic verdict in `build_audit_report`: `Broken` if any request failed, `Degraded` if p95 > 2.0 s with no failures, `Stable` otherwise, `Inconclusive` when no load numbers exist
+- [x] Model-authored `**Verdict:**` lines are stripped and any `Suggested Fix` section is cut, so the computed verdict cannot be overridden
+- [x] If the prompt has no URL, a remote measured URL switches the run to Audit mode via `AUDIT_MODE_NOTICE`
+- [x] `--source` and `--verify` are ignored in Audit mode
+- [x] Tests for mode detection, verdict thresholds, report composition, model overrides, the measured-URL switch, and the Local-mode regression (`tests/test_phase6_audit.py`)
+- [x] Verify live: `py agent.py "Audit https://httpbin.org/status/500 with 5 requests"` measured 5/5 failures at p95 2199 ms and reported `**Verdict:** Broken`, with no source lookup or suggester call
+

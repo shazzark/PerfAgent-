@@ -25,8 +25,8 @@ and the tool — the OpenAI-compatible tool-calling contract *is* the interface.
 
 ```
 agent.py            Orchestrator: prompt -> LLM -> tool call -> LLM -> answer,
-                    then source lookup + suggester.suggest_code_fix(), then the
-                    optional staging verification
+                    then either Local source lookup + suggest_code_fix() +
+                    optional staging verification, or a Remote Audit report
 suggester.py        suggest_code_fix(diagnosis, source) -> one fenced remediation
                     suggest_staged_file(source, fix) -> the whole fixed file
 feedback_loop.py    Staging verification: copy -> fix -> serve -> re-test -> compare
@@ -103,6 +103,49 @@ agent.run_agent()
 The assistant message containing `tool_calls` is appended before its tool
 results. OpenAI-compatible APIs reject a `tool` message whose `tool_call_id`
 does not belong to a preceding assistant turn.
+
+## Modes: Local vs Remote Audit
+
+The measured URL decides what happens after the tool loop. There are two modes:
+
+```
+first URL in prompt ──► loopback? ──► yes ──► Local mode
+        │                    │
+        │ no                 └──► no URL: wait for the measured URL
+        ▼
+   Remote Audit mode
+```
+
+- **Local** (`localhost`, `*.localhost`, or any loopback IP): the run resolves the
+  file that declares the measured route, calls `suggest_code_fix()`, and may stage
+  and verify the result. This is the only mode that can propose code.
+- **Remote Audit** (every other host, including private LAN addresses): the same
+  `run_full_diagnostic` tool measures the API, but `source_file_for`,
+  `load_source_context`, `suggest_code_fix`, and `run_feedback_loop` are not
+  reachable. The final answer is `build_audit_report(analysis, result)`.
+- If the prompt has no URL, `detect_mode` defaults to Local so the tool schema and
+  wording are usable, then `run_agent` switches to Audit mode when the measured
+  URL is remote and appends `AUDIT_MODE_NOTICE` to the next request. The branch
+  that builds the report is guarded by `audit_mode`, not by the notice, so a model
+  that ignores the notice still cannot reach the suggester.
+- `mode=MODE_LOCAL|MODE_AUDIT` forces a mode for callers and tests; any other
+  value raises `ValueError`. The CLI does not expose a flag because the URL is
+  already the input that determines the mode.
+
+The Audit verdict is computed, not generated:
+
+| Check (in order) | Verdict | Reason text |
+| --- | --- | --- |
+| `load_test` missing/empty | `Inconclusive` | diagnostic produced no measurements |
+| `failed > 0` | `Broken` | failed / total and failure rate |
+| `p95_latency_seconds > 2.0` | `Degraded` | p95 above threshold, no failures |
+| otherwise | `Stable` | no failures, p95 within threshold |
+
+`build_audit_report` also renders target, failure rate, latency, throughput, and
+the load-generator CPU delta from the payload, then appends the model's cleaned
+prose as `### Analysis`. `_clean_audit_analysis` removes any model-authored
+`**Verdict:**` line and truncates at a `Suggested Fix` heading, so prompt
+compliance is not part of the correctness argument.
 
 ## Tool contract
 
@@ -432,6 +475,20 @@ the API key never enters source control or tool output.
 - **One local run is not a benchmark.** The comparison refuses to call a change
   under 5% real and ranks new failures above any speedup, because the alternative -
   reporting whichever number looks best - teaches the user to trust noise.
+- **A remote target is audited, never patched.** The agent cannot see a remote
+  service's code, so a fix it proposed would be an unverifiable guess. Local mode
+  already exists to write and re-measure code; Audit mode is the honest alternative
+  for everything else. Mode selection is structural: a remote measurement disables
+  the source/suggester/staging path even if the prompt or model never mentioned
+  "audit".
+- **The verdict is measured, the model explains it.** Asking the model for a
+  verdict and trusting it would make health a function of model confidence. The
+  orchestrator computes `Broken`/`Degraded`/`Stable` from `failed` and p95, strips
+  a model-authored verdict, and uses the prose only for the qualitative analysis.
+  The threshold lives in code so two runs of the same payload cannot disagree.
+- **Failures outrank latency.** One HTTP 500 is `Broken` even when p95 is 50 ms,
+  because a fast error is still an outage. Treating "most requests succeeded" as
+  healthy would hide partial failures, which are the common remote symptom.
 
 ## Known limitations
 
@@ -458,6 +515,12 @@ the API key never enters source control or tool output.
   claim, it is not a confidence interval: two runs of identical code can still land
   either side of it on a heavily loaded machine, and the CPU delta inherits the
   machine-wide caveat above.
+
+- Audit mode measures one endpoint in one burst from the load generator's host. It
+  can prove failure or slowness but cannot attribute cause: there are no server
+  logs, traces, per-process CPU, or downstream timings. Its CPU/memory readings
+  describe the local client, not the remote server, so they are context only. The
+  2.0 s p95 threshold is a fixed policy default, not a per-target SLO.
 
 - The target API is a local FastAPI app with no database, so database bottleneck
   detection still depends on future target-side instrumentation.
